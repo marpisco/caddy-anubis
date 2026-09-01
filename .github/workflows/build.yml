@@ -6,11 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  GOPRIVATE: github.com/ToastyTheBot/*
-  GONOSUMCHECK: github.com/ToastyTheBot/*
-  GONOSUMDB: github.com/ToastyTheBot/*
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,14 +16,39 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Anubis asset tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes brotli zstd
+
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
+      - name: Generate Anubis assets
+        run: |
+          ANUBIS_VERSION="$(go list -m -f '{{.Version}}' github.com/TecharoHQ/anubis)"
+          git clone --branch "$ANUBIS_VERSION" --depth 1 https://github.com/TecharoHQ/anubis.git /tmp/anubis
+          cd /tmp/anubis
+          npm ci
+          npm run assets
+
       - name: Build Caddy with caddy-anubis plugin
-        run: xcaddy build --with github.com/ToastyTheBot/caddy-anubis=.
+        run: |
+          xcaddy build \
+            --with github.com/marpisco/caddy-anubis=. \
+            --replace github.com/TecharoHQ/anubis=/tmp/anubis
 
       - name: Verify binary
         run: ./caddy version
 
-      - name: Vet
-        run: go vet ./...
+      - name: Test and vet
+        run: |
+          cp go.mod "$RUNNER_TEMP/go.mod"
+          cp go.sum "$RUNNER_TEMP/go.sum"
+          go mod edit -modfile="$RUNNER_TEMP/go.mod" -replace=github.com/TecharoHQ/anubis=/tmp/anubis
+          go test -modfile="$RUNNER_TEMP/go.mod" ./...
+          go vet -modfile="$RUNNER_TEMP/go.mod" ./...

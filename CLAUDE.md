@@ -12,7 +12,7 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 ## Key Dependencies
 
 - **Caddy v2** (`github.com/caddyserver/caddy/v2`) - The host server framework.
-- **Anubis fork** (`github.com/ToastyTheBot/anubis`) - Fork of upstream Anubis with generated frontend assets checked in. Module path rewritten from `TecharoHQ` to `ToastyTheBot`. Uses matching upstream tags (e.g., `v1.25.0`).
+- **Anubis** (`github.com/TecharoHQ/anubis`) - The upstream proof-of-work challenge engine. Its Go module excludes generated browser assets, so builds clone the pinned tag and generate assets locally.
 
 ## Architecture
 
@@ -46,23 +46,29 @@ The global Anubis server is shared via `sync/atomic.Pointer[libanubis.Server]`.
 
 ### Prerequisites
 
-```bash
-export GOPRIVATE=github.com/ToastyTheBot/*
-export GONOSUMCHECK=github.com/ToastyTheBot/*,all
-export GONOSUMDB=github.com/ToastyTheBot/*
-```
+- Go 1.26.3 or newer
+- Node.js 24 or newer with npm
+- gzip, zstd, brotli, and xcaddy
 
 ### Build Caddy with Plugin
 
-The standard `xcaddy build` may fail due to Go module cache holding stale `TecharoHQ` module paths for the forked Anubis tag. Working build process:
+The standard `xcaddy build` needs a local upstream Anubis checkout because generated browser assets are not included in its Go module. Use the dependency version pinned in `go.mod`:
 
-1. Clone the fork: `git clone https://github.com/ToastyTheBot/anubis /tmp/anubis-fork`
-2. Create a temp build dir with `main.go` (imports `github.com/ToastyTheBot/caddy-anubis`) and `go.mod` containing both replace directives:
-   ```
-   replace github.com/ToastyTheBot/caddy-anubis => /path/to/caddy-anubis
-   replace github.com/ToastyTheBot/anubis => /tmp/anubis-fork
-   ```
-3. Run `go mod tidy` then `go build -o caddy -tags nobadger,nomysql,nopgx -trimpath .`
+```bash
+ANUBIS_DIR="$(mktemp -d)"
+ANUBIS_VERSION="$(go list -m -f '{{.Version}}' github.com/TecharoHQ/anubis)"
+git clone --branch "$ANUBIS_VERSION" --depth 1 https://github.com/TecharoHQ/anubis.git "$ANUBIS_DIR"
+
+(
+    cd "$ANUBIS_DIR"
+    npm ci
+    npm run assets
+)
+
+xcaddy build \
+    --with github.com/marpisco/caddy-anubis=. \
+    --replace github.com/TecharoHQ/anubis="$ANUBIS_DIR"
+```
 
 ### Run with the Local Caddyfile
 
@@ -82,8 +88,7 @@ git -c user.name="Claude Mythos" -c user.email=noreply@anthropic.com commit -m "
 
 ## CI/CD
 
-- **build.yml** - On push/PR: runs `xcaddy build`, `./caddy version`, and `go vet ./...`. Requires `GOPRIVATE` env vars.
-
-The Anubis fork has its own **upstream-sync.yml** workflow that fetches upstream release tags, builds frontend assets, and pushes tagged commits to the fork.
+- **build.yml** - On push/PR: clones the Anubis version in `go.mod`, generates its assets, builds Caddy with a temporary replacement, and runs `go test` and `go vet` with that replacement.
+- **dependabot.yml** - Checks the direct Anubis dependency daily and opens update pull requests for new upstream versions.
 
 There are no tests in this repository. `go vet ./...` is the only static check.

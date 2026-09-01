@@ -1,21 +1,44 @@
 # caddy-anubis
 
-A Caddy plugin that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers.
+A Caddy module that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers.
+
+Source: [marpisco/caddy-anubis](https://github.com/marpisco/caddy-anubis)
 
 ## Installation
 
-Build Caddy with this plugin using xcaddy:
+The Anubis Go module does not include its generated browser assets. Build Caddy from a checkout with a matching Anubis checkout whose assets have been generated.
+
+This requires Go 1.26.3 or newer, Node.js 24 or newer, npm, gzip, zstd, brotli, and xcaddy.
 
 ```bash
-GOPRIVATE=github.com/ToastyTheBot/* xcaddy build --with github.com/ToastyTheBot/caddy-anubis
+git clone https://github.com/marpisco/caddy-anubis.git
+cd caddy-anubis
+
+go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+ANUBIS_DIR="$(mktemp -d)"
+ANUBIS_VERSION="$(go list -m -f '{{.Version}}' github.com/TecharoHQ/anubis)"
+git clone --branch "$ANUBIS_VERSION" --depth 1 https://github.com/TecharoHQ/anubis.git "$ANUBIS_DIR"
+
+(
+    cd "$ANUBIS_DIR"
+    npm ci
+    npm run assets
+)
+
+xcaddy build \
+    --with github.com/marpisco/caddy-anubis=. \
+    --replace github.com/TecharoHQ/anubis="$ANUBIS_DIR"
 ```
 
 ## Usage
 
-Add `anubis` to your Caddyfile. It works both at the top level and inside `route`/`handle` blocks:
+Add `init_anubis` once per server block to serve challenge assets, then add `anubis` where protection is needed. It works at the top level and inside `route`/`handle` blocks:
 
 ```caddy
 :80 {
+    init_anubis
+
     handle {
         anubis
         reverse_proxy localhost:8080

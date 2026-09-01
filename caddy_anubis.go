@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/ToastyTheBot/anubis"
-	libanubis "github.com/ToastyTheBot/anubis/lib"
-	"github.com/ToastyTheBot/anubis/lib/policy"
+	"github.com/TecharoHQ/anubis"
+	libanubis "github.com/TecharoHQ/anubis/lib"
+	"github.com/TecharoHQ/anubis/lib/policy"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -58,7 +58,7 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
 
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info")
+	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", false)
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (initAnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("init_anubis")
 
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info")
+	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", false)
 	if err != nil {
 		return err
 	}
