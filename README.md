@@ -8,28 +8,15 @@ Source: [marpisco/caddy-anubis](https://github.com/marpisco/caddy-anubis)
 
 The Anubis Go module does not include its generated browser assets. Build Caddy from a checkout with a matching Anubis checkout whose assets have been generated.
 
-This requires Go 1.26.3 or newer, Node.js 24 or newer, npm, gzip, zstd, brotli, and xcaddy.
+This requires Go 1.26.3 or newer, Node.js 24 or newer, npm, gzip, zstd, and brotli.
 
 ```bash
 git clone https://github.com/marpisco/caddy-anubis.git
 cd caddy-anubis
-
-go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-
-ANUBIS_DIR="$(mktemp -d)"
-ANUBIS_VERSION="$(go list -m -f '{{.Version}}' github.com/TecharoHQ/anubis)"
-git clone --branch "$ANUBIS_VERSION" --depth 1 https://github.com/TecharoHQ/anubis.git "$ANUBIS_DIR"
-
-(
-    cd "$ANUBIS_DIR"
-    npm ci
-    npm run assets
-)
-
-xcaddy build \
-    --with github.com/marpisco/caddy-anubis=. \
-    --replace github.com/TecharoHQ/anubis="$ANUBIS_DIR"
+./setup.sh
 ```
+
+`setup.sh` installs `xcaddy` automatically if needed, generates Anubis assets from the version pinned in `go.mod`, and builds a local `./caddy` executable.
 
 ## Usage
 
