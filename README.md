@@ -33,12 +33,10 @@ xcaddy build \
 
 ## Usage
 
-Add `init_anubis` once per server block to serve challenge assets, then add `anubis` where protection is needed. It works at the top level and inside `route`/`handle` blocks:
+Add `anubis` where protection is needed. It works at the top level and inside `route`/`handle` blocks:
 
 ```caddy
 :80 {
-    init_anubis
-
     handle {
         anubis
         reverse_proxy localhost:8080
