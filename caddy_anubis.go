@@ -3,6 +3,7 @@ package caddyanubis
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -95,9 +96,27 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 func (m *AnubisMiddleware) Validate() error { return nil }
 
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	setAnubisClientIP(r)
 	ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
 	m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
 	return nil
+}
+
+func setAnubisClientIP(r *http.Request) {
+	clientIP, _ := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string)
+	if clientIP == "" {
+		var err error
+		clientIP, _, err = net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			clientIP = r.RemoteAddr
+		}
+	}
+
+	if net.ParseIP(clientIP) == nil {
+		r.Header.Del("X-Real-IP")
+		return
+	}
+	r.Header.Set("X-Real-IP", clientIP)
 }
 
 func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -148,6 +167,7 @@ func (anubisStaticMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, 
 	if srv == nil || !strings.HasPrefix(r.URL.Path, "/.within.website/") {
 		return next.ServeHTTP(w, r)
 	}
+	setAnubisClientIP(r)
 	r.RequestURI = r.URL.RequestURI()
 	srv.ServeHTTP(w, r)
 	return nil
@@ -212,6 +232,7 @@ func (initAnubisMiddleware) Validate() error { return nil }
 
 func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if strings.HasPrefix(r.URL.Path, "/.within.website/") {
+		setAnubisClientIP(r)
 		r.RequestURI = r.URL.RequestURI()
 		m.anubisServer.ServeHTTP(w, r)
 		return nil

@@ -46,6 +46,8 @@ Add `init_anubis` once per server block to serve challenge assets, then add `anu
 }
 ```
 
+The module passes Caddy's resolved client IP to Anubis. When Caddy is behind a proxy, configure Caddy's trusted proxy settings so it resolves the original client IP correctly.
+
 ### Options
 
 ```caddy
