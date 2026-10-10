@@ -2,10 +2,14 @@ package caddyanubis
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -50,10 +54,11 @@ func init() {
 
 // anubisOptions are the options shared by anubis and init_anubis.
 type anubisOptions struct {
-	PolicyFile      string `json:"policy_file,omitempty"`
-	ServeRobotsTXT  bool   `json:"serve_robots_txt,omitempty"`
-	CookieDomain    string `json:"cookie_domain,omitempty"`
-	OpenGraphTarget string `json:"opengraph_target,omitempty"`
+	PolicyFile               string `json:"policy_file,omitempty"`
+	ServeRobotsTXT           bool   `json:"serve_robots_txt,omitempty"`
+	CookieDomain             string `json:"cookie_domain,omitempty"`
+	OpenGraphTarget          string `json:"opengraph_target,omitempty"`
+	Ed25519PrivateKeyHexFile string `json:"ed25519_private_key_hex_file,omitempty"`
 }
 
 // unmarshalOption parses the Caddyfile option the dispenser is on.
@@ -82,6 +87,12 @@ func (o *anubisOptions) unmarshalOption(d *caddyfile.Dispenser) error {
 			return err
 		}
 		o.OpenGraphTarget = val
+	case "ed25519_private_key_hex_file":
+		val, err := singleArg(d)
+		if err != nil {
+			return err
+		}
+		o.Ed25519PrivateKeyHexFile = val
 	default:
 		return d.Errf("unrecognized option: %s", d.Val())
 	}
@@ -114,6 +125,15 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 		return nil, errors.New("anubis: the policy enables openGraph, set opengraph_target to the address the pages can be fetched from")
 	}
 
+	// A nil key makes Anubis generate a new one, as it does without the option.
+	var signingKey ed25519.PrivateKey
+	if o.Ed25519PrivateKeyHexFile != "" {
+		signingKey, err = loadSigningKey(o.Ed25519PrivateKeyHexFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return libanubis.New(libanubis.Options{
 		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			down, ok := r.Context().Value(downstreamCtxKey{}).(*downstream)
@@ -123,13 +143,31 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 			}
 			down.err = down.next.ServeHTTP(w, r)
 		}),
-		Policy:           pol,
-		OpenGraph:        pol.OpenGraph,
-		Target:           o.OpenGraphTarget,
-		CookieDomain:     o.CookieDomain,
-		ServeRobotsTXT:   o.ServeRobotsTXT,
-		CookieExpiration: anubis.CookieDefaultExpirationTime,
+		ED25519PrivateKey: signingKey,
+		Policy:            pol,
+		OpenGraph:         pol.OpenGraph,
+		Target:            o.OpenGraphTarget,
+		CookieDomain:      o.CookieDomain,
+		ServeRobotsTXT:    o.ServeRobotsTXT,
+		CookieExpiration:  anubis.CookieDefaultExpirationTime,
 	})
+}
+
+// loadSigningKey reads a hex-encoded ed25519 seed from path and builds the
+// signing key from it. Its errors never include the file content.
+func loadSigningKey(path string) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("anubis: ed25519_private_key_hex_file %s: %w", path, err)
+	}
+	seed, err := hex.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("anubis: ed25519_private_key_hex_file %s: content is not hex-encoded", path)
+	}
+	if len(seed) != ed25519.SeedSize {
+		return nil, fmt.Errorf("anubis: ed25519_private_key_hex_file %s: want a %d-byte seed, got %d bytes", path, ed25519.SeedSize, len(seed))
+	}
+	return ed25519.NewKeyFromSeed(seed), nil
 }
 
 // serveAnubis lets srv handle r. The next handler is what runs when Anubis
