@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/TecharoHQ/anubis v1.27.0
-	github.com/caddyserver/caddy/v2 v2.11.6
+	github.com/caddyserver/caddy/v2 v2.11.7
 	go.uber.org/zap v1.28.0
 )
 
@@ -73,6 +73,7 @@ require (
 	github.com/djherbis/times v1.6.0 // indirect
 	github.com/dlclark/regexp2/v2 v2.8.0 // indirect
 	github.com/dunglas/go-urlpattern v1.0.0 // indirect
+	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/fahedouch/go-logrotate v0.3.0 // indirect
