@@ -374,6 +374,48 @@ func TestPolicyFileOnHandlerConflictsWithInitAnubis(t *testing.T) {
 	}
 }
 
+func TestDownstreamErrorRunsHandleErrors(t *testing.T) {
+	policy := writePolicy(t, `^/open`)
+
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://e.localhost:%d {
+		handle {
+			anubis {
+				policy_file %q
+			}
+			error "boom" 502
+		}
+		handle_errors {
+			respond "handled {err.status_code}" 502
+		}
+	}
+	`, httpPort, policy),
+		"with init_anubis": fmt.Sprintf(`http://e.localhost:%d {
+		init_anubis {
+			policy_file %q
+		}
+		handle {
+			anubis
+			error "boom" 502
+		}
+		handle_errors {
+			respond "handled {err.status_code}" 502
+		}
+	}
+	`, httpPort, policy),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			got := newBrowser(t).get(siteURL("e.localhost", "/open"))
+			if got.status != http.StatusBadGateway || got.body != "handled 502" {
+				t.Errorf("got status %d body %.100q, want 502 %q", got.status, got.body, "handled 502")
+			}
+		})
+	}
+}
+
 func TestTargetRedirectsWhenAllowed(t *testing.T) {
 	const target = "https://example.com/"
 	policy := writePolicy(t, `^/open-a`)

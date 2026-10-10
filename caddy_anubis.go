@@ -35,6 +35,7 @@ type downstreamCtxKey struct{}
 // downstream is what Anubis calls once it allows a request.
 type downstream struct {
 	next caddyhttp.Handler
+	err  error
 }
 
 func init() {
@@ -67,7 +68,7 @@ func (o *anubisOptions) unmarshalOption(d *caddyfile.Dispenser) error {
 
 // newServer loads the policy and builds an Anubis server with its own signing
 // key and challenge store.
-func (o *anubisOptions) newServer(ctx caddy.Context, logger *zap.Logger) (*libanubis.Server, error) {
+func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) {
 	pol, err := libanubis.LoadPoliciesOrDefault(ctx, o.PolicyFile, anubis.DefaultDifficulty, "info", false)
 	if err != nil {
 		return nil, err
@@ -80,9 +81,7 @@ func (o *anubisOptions) newServer(ctx caddy.Context, logger *zap.Logger) (*liban
 				http.NotFound(w, r)
 				return
 			}
-			if err := down.next.ServeHTTP(w, r); err != nil {
-				logger.Error("downstream handler error", zap.Error(err))
-			}
+			down.err = down.next.ServeHTTP(w, r)
 		}),
 		Policy:           pol,
 		ServeRobotsTXT:   true,
@@ -91,11 +90,13 @@ func (o *anubisOptions) newServer(ctx caddy.Context, logger *zap.Logger) (*liban
 }
 
 // serveAnubis lets srv handle r. The next handler is what runs when Anubis
-// allows the request.
-func serveAnubis(srv *libanubis.Server, w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) {
+// allows the request. It returns the error of that handler, if any.
+func serveAnubis(srv *libanubis.Server, w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	setAnubisClientIP(r)
-	ctx := context.WithValue(r.Context(), downstreamCtxKey{}, &downstream{next: next})
+	down := &downstream{next: next}
+	ctx := context.WithValue(r.Context(), downstreamCtxKey{}, down)
 	srv.ServeHTTP(w, r.WithContext(ctx))
+	return down.err
 }
 
 // AnubisMiddleware is a Caddy middleware that integrates Anubis proof-of-work
@@ -123,7 +124,7 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 
 	// Built even if init_anubis ends up serving requests, so that a broken
 	// policy file fails the config load.
-	srv, err := m.newServer(ctx, m.logger)
+	srv, err := m.newServer(ctx)
 	if err != nil {
 		return err
 	}
@@ -147,8 +148,7 @@ func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	if m.Target != nil {
 		next = caddyhttp.HandlerFunc(m.redirectToTarget)
 	}
-	serveAnubis(srv, w, r, next)
-	return nil
+	return serveAnubis(srv, w, r, next)
 }
 
 // redirectToTarget sends the visitor to the configured target.
@@ -224,7 +224,7 @@ func (initAnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("init_anubis")
 
-	srv, err := m.newServer(ctx, m.logger)
+	srv, err := m.newServer(ctx)
 	if err != nil {
 		return err
 	}
@@ -238,8 +238,7 @@ func (initAnubisMiddleware) Validate() error { return nil }
 func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if strings.HasPrefix(r.URL.Path, anubisPathPrefix) {
 		r.RequestURI = r.URL.RequestURI()
-		serveAnubis(m.anubisServer, w, r, nil)
-		return nil
+		return serveAnubis(m.anubisServer, w, r, nil)
 	}
 
 	caddyhttp.SetVar(r.Context(), siteServerVarKey, m.anubisServer)
