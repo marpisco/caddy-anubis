@@ -31,22 +31,39 @@ const (
 	browserUserAgent  = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
 )
 
-const globalOptions = `{
-	skip_install_trust
+const (
+	adminAddr = "localhost:2999"
+	adminURL  = "http://" + adminAddr
+)
+
+// globalOptionsBody is the global options block every test Caddy runs with.
+const globalOptionsBody = `	skip_install_trust
 	persist_config off
-	admin localhost:2999
+	admin ` + adminAddr + `
 	http_port 9080
 	https_port 9443
 	grace_period 1ns
-}
 `
 
 var challengeRe = regexp.MustCompile(`(?s)<script id="anubis_challenge"[^>]*>(.*?)</script>`)
 
+// buildCaddyfile returns a Caddyfile with the shared global options, extra
+// global options such as a servers block, and the site blocks.
+func buildCaddyfile(globalExtra string, sites ...string) string {
+	return "{\n" + globalOptionsBody + globalExtra + "}\n" + strings.Join(sites, "\n")
+}
+
 // startCaddy runs a real Caddy with the given site blocks.
 func startCaddy(t *testing.T, sites ...string) {
 	t.Helper()
-	caddytest.NewTester(t).InitServer(globalOptions+strings.Join(sites, "\n"), "caddyfile")
+	startCaddyWithGlobal(t, "", sites...)
+}
+
+// startCaddyWithGlobal is startCaddy with extra global options, such as a
+// servers block.
+func startCaddyWithGlobal(t *testing.T, globalExtra string, sites ...string) {
+	t.Helper()
+	caddytest.NewTester(t).InitServer(buildCaddyfile(globalExtra, sites...), "caddyfile")
 }
 
 // writePolicy writes a policy that allows paths matching openRegex without a
@@ -63,21 +80,30 @@ const openGraphPolicy = `openGraph:
   ttl: 1h
 `
 
-// writePolicyWith is writePolicy with extra top-level policy YAML appended.
-func writePolicyWith(t *testing.T, openRegex, extra string) string {
-	t.Helper()
-	policy := fmt.Sprintf(`bots:
-  - name: open
-    path_regex: %q
-    action: ALLOW
-  - name: everything-else
+// challengeEverything is a bot rule that challenges every request no earlier
+// rule matched. Test policies end with it.
+const challengeEverything = `  - name: everything-else
     path_regex: ".*"
     action: CHALLENGE
     challenge:
       algorithm: fast
       difficulty: 1
-dnsbl: false
-%s`, openRegex, extra)
+`
+
+// writePolicyWith is writePolicy with extra top-level policy YAML appended.
+func writePolicyWith(t *testing.T, openRegex, extra string) string {
+	t.Helper()
+	return writePolicyFile(t, fmt.Sprintf(`bots:
+  - name: open
+    path_regex: %q
+    action: ALLOW
+`+challengeEverything+`dnsbl: false
+%s`, openRegex, extra))
+}
+
+// writePolicyFile writes policy YAML to a temp file and returns its path.
+func writePolicyFile(t *testing.T, policy string) string {
+	t.Helper()
 	file := filepath.Join(t.TempDir(), "policy.yaml")
 	if err := os.WriteFile(file, []byte(policy), 0o600); err != nil {
 		t.Fatal(err)
@@ -147,6 +173,13 @@ func newBrowser(t *testing.T) *browser {
 // get requests rawURL, optionally sending extra cookies.
 func (b *browser) get(rawURL string, cookies ...*http.Cookie) page {
 	b.t.Helper()
+	return b.getWith(rawURL, nil, cookies...)
+}
+
+// getWith is get with extra request headers. A header given here replaces the
+// browser default of the same name, such as User-Agent.
+func (b *browser) getWith(rawURL string, headers http.Header, cookies ...*http.Cookie) page {
+	b.t.Helper()
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		b.t.Fatal(err)
@@ -154,6 +187,9 @@ func (b *browser) get(rawURL string, cookies ...*http.Cookie) page {
 	req.Header.Set("User-Agent", browserUserAgent)
 	// Anubis randomly rejects clients that do not accept gzip.
 	req.Header.Set("Accept-Encoding", "gzip")
+	for name, values := range headers {
+		req.Header[name] = values
+	}
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}
