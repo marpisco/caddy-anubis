@@ -89,6 +89,6 @@ git -c user.name="Claude Mythos" -c user.email=noreply@anthropic.com commit -m "
 ## CI/CD
 
 - **build.yml** - On push/PR: clones the Anubis version in `go.mod`, generates its assets, builds Caddy with a temporary replacement, and runs `go test` and `go vet` with that replacement.
-- **dependabot.yml** - Checks the direct Anubis dependency daily and opens update pull requests for new upstream versions.
+- **dependabot.yml** - Checks the direct Anubis and Caddy dependencies daily and opens update pull requests for new upstream versions.
 
 There are no tests in this repository. `go vet ./...` is the only static check.
