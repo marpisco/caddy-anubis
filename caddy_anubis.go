@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/TecharoHQ/anubis"
 	libanubis "github.com/TecharoHQ/anubis/lib"
@@ -150,7 +151,12 @@ type AnubisMiddleware struct {
 
 	Target *string `json:"target,omitempty"`
 
+	// anubisServer is the server of the handler itself. With options it is
+	// built in Provision; without them, on the first request that needs it.
 	anubisServer *libanubis.Server
+	buildErr     error
+	buildOnce    *sync.Once
+	ctx          caddy.Context
 	logger       *zap.Logger
 }
 
@@ -163,28 +169,49 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
+	m.ctx = ctx
+	m.buildOnce = new(sync.Once)
 
-	// Built even if init_anubis ends up serving requests, so that a broken
-	// policy file fails the config load.
-	srv, err := m.newServer(ctx)
-	if err != nil {
-		return err
+	// Without options the handler uses the policy built into Anubis, so there
+	// is nothing to check. Building a server loads a policy, which leaves a
+	// goroutine behind for good, so it waits until a request needs the server.
+	if m.anubisOptions != (anubisOptions{}) {
+		// Built even if init_anubis ends up serving requests, so that a
+		// broken policy file fails the config load.
+		srv, err := m.newServer(ctx)
+		if err != nil {
+			return err
+		}
+		m.anubisServer = srv
 	}
-	m.anubisServer = srv
 	m.logger.Info("anubis middleware provisioned")
 	return nil
+}
+
+// ownServer returns the server of the handler itself, building it on first use
+// if Provision did not. A failed build is not retried.
+func (m *AnubisMiddleware) ownServer() (*libanubis.Server, error) {
+	m.buildOnce.Do(func() {
+		if m.anubisServer == nil {
+			m.anubisServer, m.buildErr = m.newServer(m.ctx)
+		}
+	})
+	return m.anubisServer, m.buildErr
 }
 
 func (m *AnubisMiddleware) Validate() error { return nil }
 
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	srv := m.anubisServer
-	if siteServer, ok := caddyhttp.GetVar(r.Context(), siteServerVarKey).(*libanubis.Server); ok {
-		if m.anubisOptions != (anubisOptions{}) {
-			return caddyhttp.Error(http.StatusInternalServerError,
-				errors.New("anubis: the site has init_anubis, so only target may be set on the anubis handler; set the other options on init_anubis instead"))
+	srv, ok := caddyhttp.GetVar(r.Context(), siteServerVarKey).(*libanubis.Server)
+	if ok && m.anubisOptions != (anubisOptions{}) {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			errors.New("anubis: the site has init_anubis, so only target may be set on the anubis handler; set the other options on init_anubis instead"))
+	}
+	if !ok {
+		var err error
+		if srv, err = m.ownServer(); err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
-		srv = siteServer
 	}
 
 	if m.Target != nil {
