@@ -141,6 +141,40 @@ The module passes Caddy's resolved client IP to Anubis and overwrites any `X-Rea
 
 Without trusted proxies, client-address headers are ignored and the address of the direct peer is used.
 
+### Access log
+
+A challenge page and a deny page are both answered with status 200 by default, so the access log cannot tell them from the real page. The module records what Anubis decided in two request variables, which `log_append` can add to the access log:
+
+```caddy
+example.com {
+    log {
+        output file /var/log/caddy/example.com.access.log
+        format json
+    }
+    log_append anubis_result {http.vars.anubis_result}
+    log_append anubis_rule {http.vars.anubis_rule}
+
+    init_anubis
+    handle {
+        anubis
+        reverse_proxy localhost:8080
+    }
+}
+```
+
+`anubis_result` is one of:
+
+- `allow`: a rule allowed the request without a challenge.
+- `challenge`: a challenge page was served.
+- `pass`: the request carried a valid challenge cookie and went through.
+- `deny`: a rule denied the request.
+
+`anubis_rule` is the name of the rule that decided. Both are `null` for requests Anubis did not check: the paths under `/.within.website/`, and requests that never reach an `anubis` handler. A solved challenge shows as a request to `/.within.website/x/cmd/anubis/api/pass-challenge` answered with 302.
+
+Anubis also adds the headers `X-Anubis-Rule`, `X-Anubis-Action` and `X-Anubis-Status` to the requests it lets through to the upstream. The module removes any copies sent by the client.
+
+Anubis' own Prometheus counters are not exposed by Caddy's metrics endpoint. Anubis writes one log line per challenge issued and per denied request, through its own logger, to Caddy's standard error.
+
 ### Reloads
 
 - Without `ed25519_private_key_hex_file`, the signing key is created when the configuration is loaded, so after a `caddy reload` or a restart every visitor solves the challenge again. With it, cookies stay valid.

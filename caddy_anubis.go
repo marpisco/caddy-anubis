@@ -15,6 +15,7 @@ import (
 
 	"github.com/TecharoHQ/anubis"
 	libanubis "github.com/TecharoHQ/anubis/lib"
+	"github.com/TecharoHQ/anubis/lib/config"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -30,6 +31,21 @@ const (
 	// siteServerVarKey is the request variable init_anubis uses to publish
 	// the site's Anubis server to the anubis handlers further down the chain.
 	siteServerVarKey = "anubis.site_server"
+
+	// Request variables with the decision Anubis made, for the access log.
+	anubisRuleVarKey   = "anubis_rule"
+	anubisResultVarKey = "anubis_result"
+
+	// Headers Anubis adds to the requests it checks. Clients must not send them.
+	anubisRuleHeader   = "X-Anubis-Rule"
+	anubisActionHeader = "X-Anubis-Action"
+	anubisStatusHeader = "X-Anubis-Status"
+
+	// Values of anubis_result.
+	resultAllow     = "allow"
+	resultPass      = "pass"
+	resultChallenge = "challenge"
+	resultDeny      = "deny"
 )
 
 // downstreamCtxKey is used to pass the handler that runs after Anubis allows a
@@ -39,8 +55,9 @@ type downstreamCtxKey struct{}
 
 // downstream is what Anubis calls once it allows a request.
 type downstream struct {
-	next caddyhttp.Handler
-	err  error
+	next   caddyhttp.Handler
+	called bool
+	err    error
 }
 
 func init() {
@@ -141,6 +158,7 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 				http.NotFound(w, r)
 				return
 			}
+			down.called = true
 			down.err = down.next.ServeHTTP(w, r)
 		}),
 		ED25519PrivateKey: signingKey,
@@ -174,10 +192,44 @@ func loadSigningKey(path string) (ed25519.PrivateKey, error) {
 // allows the request. It returns the error of that handler, if any.
 func serveAnubis(srv *libanubis.Server, w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	setAnubisClientIP(r)
+	// Anubis appends its headers, so a client's copies would come first.
+	r.Header.Del(anubisRuleHeader)
+	r.Header.Del(anubisActionHeader)
+	r.Header.Del(anubisStatusHeader)
+
 	down := &downstream{next: next}
 	ctx := context.WithValue(r.Context(), downstreamCtxKey{}, down)
 	srv.ServeHTTP(w, r.WithContext(ctx))
+	recordAnubisDecision(r, down.called)
 	return down.err
+}
+
+// recordAnubisDecision sets the request variables for the decision Anubis made
+// on r. It sets nothing when Anubis made no decision, as on its own paths.
+func recordAnubisDecision(r *http.Request, called bool) {
+	action := r.Header.Get(anubisActionHeader)
+	if action == "" {
+		return
+	}
+	caddyhttp.SetVar(r.Context(), anubisRuleVarKey, r.Header.Get(anubisRuleHeader))
+	caddyhttp.SetVar(r.Context(), anubisResultVarKey, anubisResult(action, called))
+}
+
+// anubisResult names the action Anubis took for the access log. A challenge
+// whose request reached the next handler was passed.
+func anubisResult(action string, called bool) string {
+	switch action {
+	case string(config.RuleAllow):
+		return resultAllow
+	case string(config.RuleDeny):
+		return resultDeny
+	case string(config.RuleChallenge):
+		if called {
+			return resultPass
+		}
+		return resultChallenge
+	}
+	return strings.ToLower(action)
 }
 
 // AnubisMiddleware is a Caddy middleware that integrates Anubis proof-of-work

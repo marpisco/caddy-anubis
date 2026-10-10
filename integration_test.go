@@ -114,8 +114,14 @@ func writePolicyFile(t *testing.T, policy string) string {
 // protectedSite is a site with init_anubis plus an anubis handler in front of
 // a site-specific response.
 func protectedSite(host, policyFile, body string) string {
+	return protectedSiteWith(host, policyFile, "", body)
+}
+
+// protectedSiteWith is protectedSite with extra directives in the site block,
+// before init_anubis. Each line of extra ends with a newline.
+func protectedSiteWith(host, policyFile, extra, body string) string {
 	return fmt.Sprintf(`http://%s:%d {
-	init_anubis {
+%s	init_anubis {
 		policy_file %q
 	}
 	handle {
@@ -123,7 +129,7 @@ func protectedSite(host, policyFile, body string) string {
 		respond %q
 	}
 }
-`, host, httpPort, policyFile, body)
+`, host, httpPort, extra, policyFile, body)
 }
 
 func siteURL(host, path string) string {
