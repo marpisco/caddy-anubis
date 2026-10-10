@@ -109,6 +109,18 @@ func TestAdaptRejectsInvalidCaddyfile(t *testing.T) {
 }`,
 			wantSubstr: "bogus",
 		},
+		{
+			name: "anubis serve_robots_txt with argument",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			serve_robots_txt yes
+		}
+		respond "ok"
+	}
+}`,
+			wantSubstr: "yes",
+		},
 	}
 
 	for _, tt := range tests {
@@ -153,5 +165,60 @@ func TestAdaptAcceptsValidAnubisOptions(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("adapted JSON does not contain %s\n%s", want, out)
 		}
+	}
+}
+
+func TestAdaptServeRobotsTXTOption(t *testing.T) {
+	tests := []struct {
+		name        string
+		caddyfile   string
+		want        string
+		wantPresent bool
+	}{
+		{
+			name: "anubis with serve_robots_txt",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			serve_robots_txt
+		}
+		respond "ok"
+	}
+}`,
+			want:        `"serve_robots_txt":true`,
+			wantPresent: true,
+		},
+		{
+			name: "init_anubis with serve_robots_txt",
+			caddyfile: `:9080 {
+	init_anubis {
+		serve_robots_txt
+	}
+}`,
+			want:        `"serve_robots_txt":true`,
+			wantPresent: true,
+		},
+		{
+			name: "anubis without serve_robots_txt",
+			caddyfile: `:9080 {
+	handle {
+		anubis
+		respond "ok"
+	}
+}`,
+			want: `serve_robots_txt`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := adaptCaddyfile(t, tt.caddyfile)
+			if err != nil {
+				t.Fatalf("Adapt returned error: %v", err)
+			}
+			if got := strings.Contains(string(out), tt.want); got != tt.wantPresent {
+				t.Errorf("adapted JSON contains %s = %t, want %t\n%s", tt.want, got, tt.wantPresent, out)
+			}
+		})
 	}
 }

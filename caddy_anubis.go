@@ -49,7 +49,8 @@ func init() {
 
 // anubisOptions are the options shared by anubis and init_anubis.
 type anubisOptions struct {
-	PolicyFile string `json:"policy_file,omitempty"`
+	PolicyFile     string `json:"policy_file,omitempty"`
+	ServeRobotsTXT bool   `json:"serve_robots_txt,omitempty"`
 }
 
 // unmarshalOption parses the Caddyfile option the dispenser is on.
@@ -60,6 +61,11 @@ func (o *anubisOptions) unmarshalOption(d *caddyfile.Dispenser) error {
 			return d.ArgErr()
 		}
 		o.PolicyFile = d.Val()
+	case "serve_robots_txt":
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+		o.ServeRobotsTXT = true
 	default:
 		return d.Errf("unrecognized option: %s", d.Val())
 	}
@@ -84,7 +90,7 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 			down.err = down.next.ServeHTTP(w, r)
 		}),
 		Policy:           pol,
-		ServeRobotsTXT:   true,
+		ServeRobotsTXT:   o.ServeRobotsTXT,
 		CookieExpiration: anubis.CookieDefaultExpirationTime,
 	})
 }
@@ -138,9 +144,9 @@ func (m *AnubisMiddleware) Validate() error { return nil }
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	srv := m.anubisServer
 	if siteServer, ok := caddyhttp.GetVar(r.Context(), siteServerVarKey).(*libanubis.Server); ok {
-		if m.PolicyFile != "" {
+		if m.anubisOptions != (anubisOptions{}) {
 			return caddyhttp.Error(http.StatusInternalServerError,
-				errors.New("anubis: policy_file is set on the anubis handler but the site has init_anubis; set policy_file on init_anubis instead"))
+				errors.New("anubis: the site has init_anubis, so only target may be set on the anubis handler; set the other options on init_anubis instead"))
 		}
 		srv = siteServer
 	}

@@ -355,22 +355,90 @@ func TestInitAnubisAnswers404ForUnknownAnubisPaths(t *testing.T) {
 	}
 }
 
-func TestPolicyFileOnHandlerConflictsWithInitAnubis(t *testing.T) {
+func TestSharedOptionOnHandlerConflictsWithInitAnubis(t *testing.T) {
 	policy := writePolicy(t, `^/open-a`)
-	startCaddy(t, fmt.Sprintf(`http://conflict.localhost:%d {
+	handlerOptions := map[string]string{
+		"policy_file":      fmt.Sprintf("policy_file %q", policy),
+		"serve_robots_txt": "serve_robots_txt",
+	}
+	for name, option := range handlerOptions {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, fmt.Sprintf(`http://conflict.localhost:%d {
 	init_anubis
 	handle {
 		anubis {
-			policy_file %q
+			%s
 		}
 		respond "upstream-body"
 	}
 }
-`, httpPort, policy))
+`, httpPort, option))
 
-	got := newBrowser(t).get(siteURL("conflict.localhost", "/open-a"))
-	if got.status != http.StatusInternalServerError || strings.Contains(got.body, "upstream-body") {
-		t.Errorf("got status %d body %.100q, want 500 without the upstream body", got.status, got.body)
+			got := newBrowser(t).get(siteURL("conflict.localhost", "/open-a"))
+			if got.status != http.StatusInternalServerError || strings.Contains(got.body, "upstream-body") {
+				t.Errorf("got status %d body %.100q, want 500 without the upstream body", got.status, got.body)
+			}
+		})
+	}
+}
+
+func TestRobotsTXTIsUpstreamByDefault(t *testing.T) {
+	policy := writePolicy(t, `^/robots\.txt$`)
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://robots.localhost:%d {
+	handle {
+		anubis {
+			policy_file %q
+		}
+		respond "site-robots"
+	}
+}
+`, httpPort, policy),
+		"with init_anubis": protectedSite("robots.localhost", policy, "site-robots"),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			assertBody(t, newBrowser(t).get(siteURL("robots.localhost", "/robots.txt")), "site-robots")
+		})
+	}
+}
+
+func TestServeRobotsTXTOptionServesAnubisRobots(t *testing.T) {
+	policy := writePolicy(t, `^/robots\.txt$`)
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://robots.localhost:%d {
+	handle {
+		anubis {
+			policy_file %q
+			serve_robots_txt
+		}
+		respond "site-robots"
+	}
+}
+`, httpPort, policy),
+		"with init_anubis": fmt.Sprintf(`http://robots.localhost:%d {
+	init_anubis {
+		policy_file %q
+		serve_robots_txt
+	}
+	handle {
+		anubis
+		respond "site-robots"
+	}
+}
+`, httpPort, policy),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			got := newBrowser(t).get(siteURL("robots.localhost", "/robots.txt"))
+			if got.status != http.StatusOK || !strings.Contains(got.body, "User-agent:") || got.body == "site-robots" {
+				t.Errorf("got status %d body %.100q, want 200 with Anubis robots.txt", got.status, got.body)
+			}
+		})
 	}
 }
 
