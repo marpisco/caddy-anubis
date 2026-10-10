@@ -11,12 +11,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +53,19 @@ func startCaddy(t *testing.T, sites ...string) {
 // challenge and challenges everything else. It returns the file path.
 func writePolicy(t *testing.T, openRegex string) string {
 	t.Helper()
+	return writePolicyWith(t, openRegex, "")
+}
+
+// openGraphPolicy is extra policy YAML that enables Open Graph tags.
+const openGraphPolicy = `openGraph:
+  enabled: true
+  considerHost: false
+  ttl: 1h
+`
+
+// writePolicyWith is writePolicy with extra top-level policy YAML appended.
+func writePolicyWith(t *testing.T, openRegex, extra string) string {
+	t.Helper()
 	policy := fmt.Sprintf(`bots:
   - name: open
     path_regex: %q
@@ -62,7 +77,7 @@ func writePolicy(t *testing.T, openRegex string) string {
       algorithm: fast
       difficulty: 1
 dnsbl: false
-`, openRegex)
+%s`, openRegex, extra)
 	file := filepath.Join(t.TempDir(), "policy.yaml")
 	if err := os.WriteFile(file, []byte(policy), 0o600); err != nil {
 		t.Fatal(err)
@@ -177,6 +192,14 @@ func (b *browser) cookiesFor(rawURL string) []*http.Cookie {
 // the Anubis script does, and returns the page served after the redirect.
 func (b *browser) passChallenge(rawURL string) page {
 	b.t.Helper()
+	passed := b.passChallengeResponse(rawURL)
+	return b.get(passed.header.Get("Location"))
+}
+
+// passChallengeResponse solves the challenge for rawURL like passChallenge does
+// and returns the pass-challenge response itself, before the redirect.
+func (b *browser) passChallengeResponse(rawURL string) page {
+	b.t.Helper()
 	p := b.get(rawURL)
 	match := challengeRe.FindStringSubmatch(p.body)
 	if match == nil {
@@ -222,7 +245,7 @@ func (b *browser) passChallenge(rawURL string) page {
 	if passed.status != http.StatusFound {
 		b.t.Fatalf("pass-challenge for %s: want 302, got %d: %.200s", rawURL, passed.status, passed.body)
 	}
-	return b.get(passed.header.Get("Location"))
+	return passed
 }
 
 func assertBody(t *testing.T, p page, want string) {
@@ -481,6 +504,115 @@ func TestDownstreamErrorRunsHandleErrors(t *testing.T) {
 				t.Errorf("got status %d body %.100q, want 502 %q", got.status, got.body, "handled 502")
 			}
 		})
+	}
+}
+
+func TestCookieDomainOption(t *testing.T) {
+	policy := writePolicy(t, `^/open-a`)
+	startCaddy(t,
+		fmt.Sprintf(`http://app.example.localhost:%d {
+	init_anubis {
+		policy_file %q
+		cookie_domain example.localhost
+	}
+	handle {
+		anubis
+		respond "site-app"
+	}
+}
+`, httpPort, policy),
+		protectedSite("plain.example.localhost", policy, "site-plain"),
+	)
+
+	visitor := newBrowser(t)
+	passed := visitor.passChallengeResponse(siteURL("app.example.localhost", "/page"))
+	cookies := strings.Join(passed.header.Values("Set-Cookie"), "\n")
+	if !strings.Contains(cookies, "Domain=example.localhost") {
+		t.Errorf("Set-Cookie = %q, want Domain=example.localhost", cookies)
+	}
+	assertBody(t, visitor.get(siteURL("app.example.localhost", "/page")), "site-app")
+
+	passed = visitor.passChallengeResponse(siteURL("plain.example.localhost", "/page"))
+	cookies = strings.Join(passed.header.Values("Set-Cookie"), "\n")
+	if cookies == "" || strings.Contains(cookies, "Domain=") {
+		t.Errorf("Set-Cookie = %q, want a cookie without a Domain attribute", cookies)
+	}
+}
+
+// ogUpstream is a backend whose pages carry an og:title tag. It records the
+// requests it gets, so a test can see what Anubis fetched from it.
+type ogUpstream struct {
+	*httptest.Server
+	mu   sync.Mutex
+	seen []string
+}
+
+func newOGUpstream(t *testing.T) *ogUpstream {
+	t.Helper()
+	u := &ogUpstream{}
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.mu.Lock()
+		u.seen = append(u.seen, r.Host+r.URL.RequestURI())
+		u.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><html><head><title>Real Page</title><meta property="og:title" content="Real Page Title"></head><body>real page</body></html>`)
+	}))
+	t.Cleanup(u.Close)
+	return u
+}
+
+// requests returns the Host and request URI of every request the upstream got.
+func (u *ogUpstream) requests() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.seen...)
+}
+
+func TestOpenGraphTagsAreFetchedFromOpengraphTarget(t *testing.T) {
+	upstream := newOGUpstream(t)
+	policy := writePolicyWith(t, `^/nothing-is-open`, openGraphPolicy)
+	startCaddy(t, fmt.Sprintf(`http://og.localhost:%d {
+	init_anubis {
+		policy_file %q
+		opengraph_target %s
+	}
+	handle {
+		anubis
+		reverse_proxy %s
+	}
+}
+`, httpPort, policy, upstream.URL, upstream.Listener.Addr().String()))
+
+	challenge := newBrowser(t).get(siteURL("og.localhost", "/"))
+	assertChallenged(t, challenge)
+	if !strings.Contains(challenge.body, `property="og:title" content="Real Page Title"`) {
+		t.Errorf("challenge page has no og:title tag with Real Page Title")
+	}
+	t.Logf("upstream requests: %v", upstream.requests())
+}
+
+func TestOpenGraphTagsNeedTheOpenGraphPolicy(t *testing.T) {
+	upstream := newOGUpstream(t)
+	policy := writePolicy(t, `^/nothing-is-open`)
+	startCaddy(t, fmt.Sprintf(`http://nog.localhost:%d {
+	init_anubis {
+		policy_file %q
+		opengraph_target %s
+	}
+	handle {
+		anubis
+		reverse_proxy %s
+	}
+}
+`, httpPort, policy, upstream.URL, upstream.Listener.Addr().String()))
+
+	challenge := newBrowser(t).get(siteURL("nog.localhost", "/"))
+	assertChallenged(t, challenge)
+	if strings.Contains(challenge.body, "Real Page Title") {
+		t.Errorf("challenge page carries Real Page Title without an openGraph policy")
+	}
+	if got := upstream.requests(); len(got) != 0 {
+		t.Errorf("upstream got requests %v, want none", got)
 	}
 }
 

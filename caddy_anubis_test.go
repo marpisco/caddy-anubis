@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -121,6 +122,48 @@ func TestAdaptRejectsInvalidCaddyfile(t *testing.T) {
 }`,
 			wantSubstr: "yes",
 		},
+		{
+			name: "anubis cookie_domain without argument",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			cookie_domain
+		}
+		respond "ok"
+	}
+}`,
+			wantSubstr: "cookie_domain",
+		},
+		{
+			name: "anubis cookie_domain with extra argument",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			cookie_domain example.com extra
+		}
+		respond "ok"
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "init_anubis opengraph_target without argument",
+			caddyfile: `:9080 {
+	init_anubis {
+		opengraph_target
+	}
+}`,
+			wantSubstr: "opengraph_target",
+		},
+		{
+			name: "init_anubis opengraph_target with extra argument",
+			caddyfile: `:9080 {
+	init_anubis {
+		opengraph_target http://127.0.0.1:3000 extra
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +208,59 @@ func TestAdaptAcceptsValidAnubisOptions(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("adapted JSON does not contain %s\n%s", want, out)
 		}
+	}
+}
+
+func TestNewServerRequiresOpenGraphTarget(t *testing.T) {
+	policy := writePolicyWith(t, `^/open`, openGraphPolicy)
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	opts := anubisOptions{PolicyFile: policy}
+	if _, err := opts.newServer(ctx); err == nil || !strings.Contains(err.Error(), "opengraph_target") {
+		t.Errorf("newServer error = %v, want one mentioning opengraph_target", err)
+	}
+}
+
+func TestAdaptCookieDomainAndOpenGraphTarget(t *testing.T) {
+	tests := []struct {
+		name      string
+		caddyfile string
+		want      string
+	}{
+		{
+			name: "anubis with cookie_domain",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			cookie_domain example.com
+		}
+		respond "ok"
+	}
+}`,
+			want: `"cookie_domain":"example.com"`,
+		},
+		{
+			name: "init_anubis with opengraph_target",
+			caddyfile: `:9080 {
+	init_anubis {
+		opengraph_target http://127.0.0.1:3000
+	}
+}`,
+			want: `"opengraph_target":"http://127.0.0.1:3000"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := adaptCaddyfile(t, tt.caddyfile)
+			if err != nil {
+				t.Fatalf("Adapt returned error: %v", err)
+			}
+			if !strings.Contains(string(out), tt.want) {
+				t.Errorf("adapted JSON does not contain %s\n%s", tt.want, out)
+			}
+		})
 	}
 }
 
