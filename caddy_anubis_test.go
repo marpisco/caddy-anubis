@@ -164,6 +164,50 @@ func TestAdaptRejectsInvalidCaddyfile(t *testing.T) {
 }`,
 			wantSubstr: "wrong argument count",
 		},
+		{
+			name: "anubis target with extra argument",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			target a b
+		}
+		respond "ok"
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "anubis argument on directive line in handle",
+			caddyfile: `:9080 {
+	handle {
+		anubis foo
+		respond "ok"
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "anubis argument on directive line at site level",
+			caddyfile: `:9080 {
+	anubis foo
+	respond "ok"
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "init_anubis argument on directive line",
+			caddyfile: `:9080 {
+	init_anubis foo
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "init_anubis path matcher",
+			caddyfile: `:9080 {
+	init_anubis /path/*
+}`,
+			wantSubstr: "wrong argument count",
+		},
 	}
 
 	for _, tt := range tests {
@@ -208,6 +252,44 @@ func TestAdaptAcceptsValidAnubisOptions(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("adapted JSON does not contain %s\n%s", want, out)
 		}
+	}
+}
+
+func TestAdaptAcceptsRequestMatcherOnAnubisDirective(t *testing.T) {
+	tests := []struct {
+		name      string
+		caddyfile string
+		want      string
+	}{
+		{
+			name: "path matcher on the directive line",
+			caddyfile: `:9080 {
+	anubis /admin/*
+	respond "ok"
+}`,
+			want: `"path":["/admin/*"]`,
+		},
+		{
+			name: "named matcher on the directive line",
+			caddyfile: `:9080 {
+	@m path /x/*
+	anubis @m
+	respond "ok"
+}`,
+			want: `"path":["/x/*"]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := adaptCaddyfile(t, tt.caddyfile)
+			if err != nil {
+				t.Fatalf("Adapt returned error: %v", err)
+			}
+			if !strings.Contains(string(out), tt.want) {
+				t.Errorf("adapted JSON does not contain %s\n%s", tt.want, out)
+			}
+		})
 	}
 }
 

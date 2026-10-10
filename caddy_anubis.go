@@ -245,14 +245,19 @@ func setAnubisClientIP(r *http.Request) {
 
 func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
+	// A request matcher on the directive line was already taken by the handler
+	// directive wrapper, so any other argument here is a mistake.
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "target":
-			if !d.NextArg() {
-				return d.ArgErr()
+			val, err := singleArg(d)
+			if err != nil {
+				return err
 			}
-			val := d.Val()
 			m.Target = &val
 		default:
 			if err := m.unmarshalOption(d); err != nil {
@@ -316,6 +321,10 @@ func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request,
 
 func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
+	// init_anubis takes no request matcher, it must see every request of the site.
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		if err := m.unmarshalOption(d); err != nil {
