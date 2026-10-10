@@ -84,6 +84,11 @@ init_anubis {
     # Domain attribute of the Anubis cookie. Default: none (host-only cookie).
     cookie_domain example.com
 
+    # File with the signing key: a hex-encoded 32-byte ed25519 seed, for
+    # example from `openssl rand -hex 32`, readable only by Caddy.
+    # Default: a new key on every config load.
+    ed25519_private_key_hex_file /etc/caddy/anubis/example.com.key
+
     # Where Anubis fetches the real pages to read their Open Graph tags.
     # Required when the policy enables openGraph without overrides.
     opengraph_target http://localhost:8080
@@ -103,9 +108,16 @@ anubis {
 }
 ```
 
-In a site with `init_anubis`, `target` is the only option an `anubis` handler may set. Any other option on it makes its requests answer 500, so put them on `init_anubis`.
+In a site with `init_anubis`, `target` is the only option an `anubis` handler may set; put the others on `init_anubis`. This mistake is not caught by `caddy validate`: the configuration loads, and the requests that reach that handler answer 500.
 
-An unknown option, a missing argument, a missing or invalid policy file fails `caddy validate` and `caddy reload`; the running configuration keeps serving.
+An unknown option, a missing or extra argument, a missing or invalid policy file or key file fails `caddy validate` and `caddy reload`; the running configuration keeps serving.
+
+### Cookies and keys across sites
+
+Each site should have its own key file and its own cookie:
+
+- Do not set `cookie_domain` to a parent domain shared by sites that each have their own `init_anubis`. The cookie name is the same, so with different keys each site invalidates the other's cookie.
+- Sites that share a key file accept each other's cookies when their rules are the same: Anubis checks the signature and the rule, not the site.
 
 ### Policy file
 
@@ -129,9 +141,15 @@ The module passes Caddy's resolved client IP to Anubis and overwrites any `X-Rea
 
 Without trusted proxies, client-address headers are ignored and the address of the direct peer is used.
 
+### Reloads
+
+- Without `ed25519_private_key_hex_file`, the signing key is created when the configuration is loaded, so after a `caddy reload` or a restart every visitor solves the challenge again. With it, cookies stay valid.
+- The default in-memory store is also created per load. A challenge that is open during a reload fails once, and the visitor gets a new one.
+- Do not use `store: bbolt` in the policy file. Anubis never closes the database, so the next `caddy reload` waits for its file lock forever.
+- Anubis' in-memory store leaves one goroutine behind per Anubis server on every config load, until Caddy restarts. The module builds a server only where one is used: one per `init_anubis`, and one per `anubis` handler that works without it.
+
 ### Limitations
 
-- The signing key and the default in-memory store are created when the configuration is loaded. After a `caddy reload` or a restart, visitors solve the challenge again.
 - With Open Graph passthrough, Anubis requests the page from `opengraph_target` with the visitor's `Host` header while it builds the challenge page.
 
 ## Development

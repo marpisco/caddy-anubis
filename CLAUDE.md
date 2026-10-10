@@ -18,9 +18,9 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 
 The entire plugin is a single Go file: `caddy_anubis.go`. There is one Anubis server per site and no process-wide state.
 
-- **`anubisOptions`** - Options shared by both directives (`policy_file`, `serve_robots_txt`, `cookie_domain`, `opengraph_target`), embedded in both middleware structs. One Caddyfile parser (`unmarshalOption`) and one constructor (`newServer`). A new shared option goes here.
+- **`anubisOptions`** - Options shared by both directives (`policy_file`, `serve_robots_txt`, `cookie_domain`, `opengraph_target`, `ed25519_private_key_hex_file`), embedded in both middleware structs. One Caddyfile parser (`unmarshalOption`) and one constructor (`newServer`). A new shared option goes here.
 - **`initAnubisMiddleware`** - Registered via `RegisterDirective` with a route that matches every request of the site. Serves `/.within.website/*` with its server; for any other path it publishes its server in the request vars (`siteServerVarKey`) and calls next.
-- **`AnubisMiddleware`** - Uses the site's server from the request vars when `init_anubis` is present, otherwise its own server (standalone). Has the per-handler option `target <url>`. Setting a shared option on it in a site with `init_anubis` answers 500.
+- **`AnubisMiddleware`** - Uses the site's server from the request vars when `init_anubis` is present, otherwise its own server (standalone). With options that server is built in `Provision`, so a broken policy fails the load; without options it is built on the first request that needs it, because every policy load leaves an Anubis goroutine behind. Has the per-handler option `target <url>`. Setting a shared option on it in a site with `init_anubis` answers 500.
 
 Anubis only takes a plain `http.Handler` as its next handler, so the Caddy next handler travels in the request context (`downstream`), which also carries its error back to Caddy.
 

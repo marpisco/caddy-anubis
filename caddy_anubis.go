@@ -2,11 +2,16 @@ package caddyanubis
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 
 	"github.com/TecharoHQ/anubis"
 	libanubis "github.com/TecharoHQ/anubis/lib"
@@ -49,10 +54,11 @@ func init() {
 
 // anubisOptions are the options shared by anubis and init_anubis.
 type anubisOptions struct {
-	PolicyFile      string `json:"policy_file,omitempty"`
-	ServeRobotsTXT  bool   `json:"serve_robots_txt,omitempty"`
-	CookieDomain    string `json:"cookie_domain,omitempty"`
-	OpenGraphTarget string `json:"opengraph_target,omitempty"`
+	PolicyFile               string `json:"policy_file,omitempty"`
+	ServeRobotsTXT           bool   `json:"serve_robots_txt,omitempty"`
+	CookieDomain             string `json:"cookie_domain,omitempty"`
+	OpenGraphTarget          string `json:"opengraph_target,omitempty"`
+	Ed25519PrivateKeyHexFile string `json:"ed25519_private_key_hex_file,omitempty"`
 }
 
 // unmarshalOption parses the Caddyfile option the dispenser is on.
@@ -81,6 +87,12 @@ func (o *anubisOptions) unmarshalOption(d *caddyfile.Dispenser) error {
 			return err
 		}
 		o.OpenGraphTarget = val
+	case "ed25519_private_key_hex_file":
+		val, err := singleArg(d)
+		if err != nil {
+			return err
+		}
+		o.Ed25519PrivateKeyHexFile = val
 	default:
 		return d.Errf("unrecognized option: %s", d.Val())
 	}
@@ -113,6 +125,15 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 		return nil, errors.New("anubis: the policy enables openGraph, set opengraph_target to the address the pages can be fetched from")
 	}
 
+	// A nil key makes Anubis generate a new one, as it does without the option.
+	var signingKey ed25519.PrivateKey
+	if o.Ed25519PrivateKeyHexFile != "" {
+		signingKey, err = loadSigningKey(o.Ed25519PrivateKeyHexFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return libanubis.New(libanubis.Options{
 		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			down, ok := r.Context().Value(downstreamCtxKey{}).(*downstream)
@@ -122,13 +143,31 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 			}
 			down.err = down.next.ServeHTTP(w, r)
 		}),
-		Policy:           pol,
-		OpenGraph:        pol.OpenGraph,
-		Target:           o.OpenGraphTarget,
-		CookieDomain:     o.CookieDomain,
-		ServeRobotsTXT:   o.ServeRobotsTXT,
-		CookieExpiration: anubis.CookieDefaultExpirationTime,
+		ED25519PrivateKey: signingKey,
+		Policy:            pol,
+		OpenGraph:         pol.OpenGraph,
+		Target:            o.OpenGraphTarget,
+		CookieDomain:      o.CookieDomain,
+		ServeRobotsTXT:    o.ServeRobotsTXT,
+		CookieExpiration:  anubis.CookieDefaultExpirationTime,
 	})
+}
+
+// loadSigningKey reads a hex-encoded ed25519 seed from path and builds the
+// signing key from it. Its errors never include the file content.
+func loadSigningKey(path string) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("anubis: ed25519_private_key_hex_file %s: %w", path, err)
+	}
+	seed, err := hex.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("anubis: ed25519_private_key_hex_file %s: content is not hex-encoded", path)
+	}
+	if len(seed) != ed25519.SeedSize {
+		return nil, fmt.Errorf("anubis: ed25519_private_key_hex_file %s: want a %d-byte seed, got %d bytes", path, ed25519.SeedSize, len(seed))
+	}
+	return ed25519.NewKeyFromSeed(seed), nil
 }
 
 // serveAnubis lets srv handle r. The next handler is what runs when Anubis
@@ -150,7 +189,12 @@ type AnubisMiddleware struct {
 
 	Target *string `json:"target,omitempty"`
 
+	// anubisServer is the server of the handler itself. With options it is
+	// built in Provision; without them, on the first request that needs it.
 	anubisServer *libanubis.Server
+	buildErr     error
+	buildOnce    *sync.Once
+	ctx          caddy.Context
 	logger       *zap.Logger
 }
 
@@ -163,28 +207,49 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
+	m.ctx = ctx
+	m.buildOnce = new(sync.Once)
 
-	// Built even if init_anubis ends up serving requests, so that a broken
-	// policy file fails the config load.
-	srv, err := m.newServer(ctx)
-	if err != nil {
-		return err
+	// Without options the handler uses the policy built into Anubis, so there
+	// is nothing to check. Building a server loads a policy, which leaves a
+	// goroutine behind for good, so it waits until a request needs the server.
+	if m.anubisOptions != (anubisOptions{}) {
+		// Built even if init_anubis ends up serving requests, so that a
+		// broken policy file fails the config load.
+		srv, err := m.newServer(ctx)
+		if err != nil {
+			return err
+		}
+		m.anubisServer = srv
 	}
-	m.anubisServer = srv
 	m.logger.Info("anubis middleware provisioned")
 	return nil
+}
+
+// ownServer returns the server of the handler itself, building it on first use
+// if Provision did not. A failed build is not retried.
+func (m *AnubisMiddleware) ownServer() (*libanubis.Server, error) {
+	m.buildOnce.Do(func() {
+		if m.anubisServer == nil {
+			m.anubisServer, m.buildErr = m.newServer(m.ctx)
+		}
+	})
+	return m.anubisServer, m.buildErr
 }
 
 func (m *AnubisMiddleware) Validate() error { return nil }
 
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	srv := m.anubisServer
-	if siteServer, ok := caddyhttp.GetVar(r.Context(), siteServerVarKey).(*libanubis.Server); ok {
-		if m.anubisOptions != (anubisOptions{}) {
-			return caddyhttp.Error(http.StatusInternalServerError,
-				errors.New("anubis: the site has init_anubis, so only target may be set on the anubis handler; set the other options on init_anubis instead"))
+	srv, ok := caddyhttp.GetVar(r.Context(), siteServerVarKey).(*libanubis.Server)
+	if ok && m.anubisOptions != (anubisOptions{}) {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			errors.New("anubis: the site has init_anubis, so only target may be set on the anubis handler; set the other options on init_anubis instead"))
+	}
+	if !ok {
+		var err error
+		if srv, err = m.ownServer(); err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
-		srv = siteServer
 	}
 
 	if m.Target != nil {
@@ -218,14 +283,19 @@ func setAnubisClientIP(r *http.Request) {
 
 func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
+	// A request matcher on the directive line was already taken by the handler
+	// directive wrapper, so any other argument here is a mistake.
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "target":
-			if !d.NextArg() {
-				return d.ArgErr()
+			val, err := singleArg(d)
+			if err != nil {
+				return err
 			}
-			val := d.Val()
 			m.Target = &val
 		default:
 			if err := m.unmarshalOption(d); err != nil {
@@ -289,6 +359,10 @@ func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request,
 
 func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
+	// init_anubis takes no request matcher, it must see every request of the site.
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		if err := m.unmarshalOption(d); err != nil {

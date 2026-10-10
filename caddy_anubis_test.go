@@ -2,7 +2,12 @@ package caddyanubis
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -164,6 +169,68 @@ func TestAdaptRejectsInvalidCaddyfile(t *testing.T) {
 }`,
 			wantSubstr: "wrong argument count",
 		},
+		{
+			name: "anubis target with extra argument",
+			caddyfile: `:9080 {
+	handle {
+		anubis {
+			target a b
+		}
+		respond "ok"
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "anubis argument on directive line in handle",
+			caddyfile: `:9080 {
+	handle {
+		anubis foo
+		respond "ok"
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "anubis argument on directive line at site level",
+			caddyfile: `:9080 {
+	anubis foo
+	respond "ok"
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "init_anubis argument on directive line",
+			caddyfile: `:9080 {
+	init_anubis foo
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "init_anubis path matcher",
+			caddyfile: `:9080 {
+	init_anubis /path/*
+}`,
+			wantSubstr: "wrong argument count",
+		},
+		{
+			name: "init_anubis ed25519_private_key_hex_file without argument",
+			caddyfile: `:9080 {
+	init_anubis {
+		ed25519_private_key_hex_file
+	}
+}`,
+			wantSubstr: "ed25519_private_key_hex_file",
+		},
+		{
+			name: "init_anubis ed25519_private_key_hex_file with extra argument",
+			caddyfile: `:9080 {
+	init_anubis {
+		ed25519_private_key_hex_file /run/secrets/a.key extra
+	}
+}`,
+			wantSubstr: "wrong argument count",
+		},
 	}
 
 	for _, tt := range tests {
@@ -211,6 +278,44 @@ func TestAdaptAcceptsValidAnubisOptions(t *testing.T) {
 	}
 }
 
+func TestAdaptAcceptsRequestMatcherOnAnubisDirective(t *testing.T) {
+	tests := []struct {
+		name      string
+		caddyfile string
+		want      string
+	}{
+		{
+			name: "path matcher on the directive line",
+			caddyfile: `:9080 {
+	anubis /admin/*
+	respond "ok"
+}`,
+			want: `"path":["/admin/*"]`,
+		},
+		{
+			name: "named matcher on the directive line",
+			caddyfile: `:9080 {
+	@m path /x/*
+	anubis @m
+	respond "ok"
+}`,
+			want: `"path":["/x/*"]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := adaptCaddyfile(t, tt.caddyfile)
+			if err != nil {
+				t.Fatalf("Adapt returned error: %v", err)
+			}
+			if !strings.Contains(string(out), tt.want) {
+				t.Errorf("adapted JSON does not contain %s\n%s", tt.want, out)
+			}
+		})
+	}
+}
+
 func TestNewServerRequiresOpenGraphTarget(t *testing.T) {
 	policy := writePolicyWith(t, `^/open`, openGraphPolicy)
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
@@ -219,6 +324,86 @@ func TestNewServerRequiresOpenGraphTarget(t *testing.T) {
 	opts := anubisOptions{PolicyFile: policy}
 	if _, err := opts.newServer(ctx); err == nil || !strings.Contains(err.Error(), "opengraph_target") {
 		t.Errorf("newServer error = %v, want one mentioning opengraph_target", err)
+	}
+}
+
+func TestNewServerRejectsBadSigningKeyFile(t *testing.T) {
+	policy := writePolicy(t, `^/open`)
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	missing := filepath.Join(t.TempDir(), "missing.key")
+	opts := anubisOptions{PolicyFile: policy, Ed25519PrivateKeyHexFile: missing}
+	_, err := opts.newServer(ctx)
+	if err == nil || !strings.Contains(err.Error(), "ed25519_private_key_hex_file") || !strings.Contains(err.Error(), missing) {
+		t.Errorf("newServer error = %v, want one naming the option and %s", err, missing)
+	}
+}
+
+func TestLoadSigningKey(t *testing.T) {
+	seed := newSeed(t)
+	tests := []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{name: "non-hex content", content: "not hex SECRET-MARKER-123\n", wantErr: true},
+		{name: "31-byte seed", content: hex.EncodeToString(seed[:31]) + "\n", wantErr: true},
+		{name: "64 hex characters with trailing newline", content: hex.EncodeToString(seed) + "\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, err := loadSigningKey(writeKeyFile(t, tt.content))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("loadSigningKey returned nil error, want error")
+				}
+				if strings.Contains(err.Error(), strings.TrimSpace(tt.content)) {
+					t.Errorf("error %q contains the file content", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadSigningKey returned error: %v", err)
+			}
+			if !key.Equal(ed25519.NewKeyFromSeed(seed)) {
+				t.Error("loadSigningKey did not build the key from the seed")
+			}
+		})
+	}
+}
+
+// newSeed returns a random ed25519 seed.
+func newSeed(t *testing.T) []byte {
+	t.Helper()
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	return seed
+}
+
+// writeKeyFile writes content to a new key file and returns its path.
+func writeKeyFile(t *testing.T, content string) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "signing.seed")
+	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.ToSlash(file)
+}
+
+func TestAdaptEd25519PrivateKeyHexFile(t *testing.T) {
+	out, err := adaptCaddyfile(t, `:9080 {
+	init_anubis {
+		ed25519_private_key_hex_file /run/secrets/a.key
+	}
+}`)
+	if err != nil {
+		t.Fatalf("Adapt returned error: %v", err)
+	}
+	if want := `"ed25519_private_key_hex_file":"/run/secrets/a.key"`; !strings.Contains(string(out), want) {
+		t.Errorf("adapted JSON does not contain %s\n%s", want, out)
 	}
 }
 
