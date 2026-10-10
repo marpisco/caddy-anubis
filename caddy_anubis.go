@@ -125,14 +125,16 @@ func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "target":
-			if d.NextArg() {
-				val := d.Val()
-				m.Target = &val
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			val := d.Val()
+			m.Target = &val
 		case "policy_file":
-			if d.NextArg() {
-				m.PolicyFile = d.Val()
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			m.PolicyFile = d.Val()
 		default:
 			return d.Errf("unrecognized option: %s", d.Val())
 		}
@@ -143,7 +145,9 @@ func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 func parseAnubis(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m AnubisMiddleware
-	m.UnmarshalCaddyfile(h.Dispenser)
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
@@ -180,7 +184,9 @@ func (anubisStaticMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 func parseAnubisStatic(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m anubisStaticMiddleware
-	m.UnmarshalCaddyfile(h.Dispenser)
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -246,9 +252,10 @@ func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "policy_file":
-			if d.NextArg() {
-				m.PolicyFile = d.Val()
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			m.PolicyFile = d.Val()
 		default:
 			return d.Errf("unrecognized option: %s", d.Val())
 		}
