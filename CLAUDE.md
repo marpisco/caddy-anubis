@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **Caddy HTTP server module** that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers. It provides two Caddyfile directives:
 
-- **`init_anubis`** - Server-level directive that provisions the global Anubis server and serves static assets at `/.within.website/`. Place once per server block.
-- **`anubis`** - Handler-level middleware that can be used inside `handle` blocks to protect specific paths (root or subdirectory).
+- **`init_anubis`** - Site-level directive: the Anubis server of a site. Serves the assets and challenge API at `/.within.website/` and holds the site's options. Place once per site block, outside `handle`.
+- **`anubis`** - Handler-level middleware that enforces the challenge. Can be used at the top level or inside `handle`/`route` blocks to protect specific paths.
 
 ## Key Dependencies
 
@@ -16,19 +16,19 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 
 ## Architecture
 
-The entire plugin is a single Go file: `caddy_anubis.go`. Three middleware types:
+The entire plugin is a single Go file: `caddy_anubis.go`. There is one Anubis server per site and no process-wide state.
 
-- **`initAnubisMiddleware`** - Provisions the global Anubis server (with a stub `http.NotFound` next handler) and serves `/.within.website/*` routes. Registered via `RegisterDirective` so it creates its own route with path matching, independent of `handle` blocks.
-- **`AnubisMiddleware`** - Creates its own Anubis server per-instance with the correct Caddy passthrough (via `context.WithValue`). Optionally stores itself as the global server if `init_anubis` hasn't run. Supports `target <url>` and `policy_file <path>`.
-- **`anubisStaticMiddleware`** - Backward compatibility handler that delegates `/.within.website/` to the global Anubis server.
+- **`anubisOptions`** - Options shared by both directives (`policy_file`, `serve_robots_txt`, `cookie_domain`, `opengraph_target`), embedded in both middleware structs. One Caddyfile parser (`unmarshalOption`) and one constructor (`newServer`). A new shared option goes here.
+- **`initAnubisMiddleware`** - Registered via `RegisterDirective` with a route that matches every request of the site. Serves `/.within.website/*` with its server; for any other path it publishes its server in the request vars (`siteServerVarKey`) and calls next.
+- **`AnubisMiddleware`** - Uses the site's server from the request vars when `init_anubis` is present, otherwise its own server (standalone). Has the per-handler option `target <url>`. Setting a shared option on it in a site with `init_anubis` answers 500.
 
-The global Anubis server is shared via `sync/atomic.Pointer[libanubis.Server]`.
+Anubis only takes a plain `http.Handler` as its next handler, so the Caddy next handler travels in the request context (`downstream`), which also carries its error back to Caddy.
 
 ### Caddyfile Example
 
 ```caddy
 :8080 {
-    init_anubis          # Global: provisions server + serves static assets
+    init_anubis          # Site: Anubis server, assets and challenge API
 
     handle /admin/* {
         anubis           # Path-scoped: protects /admin/ only
@@ -89,6 +89,6 @@ git -c user.name="Claude Mythos" -c user.email=noreply@anthropic.com commit -m "
 ## CI/CD
 
 - **build.yml** - On push/PR: clones the Anubis version in `go.mod`, generates its assets, builds Caddy with a temporary replacement, and runs `go test` and `go vet` with that replacement.
-- **dependabot.yml** - Checks the direct Anubis dependency daily and opens update pull requests for new upstream versions.
+- **dependabot.yml** - Checks the direct Anubis and Caddy dependencies daily and opens update pull requests for new upstream versions.
 
-There are no tests in this repository. `go vet ./...` is the only static check.
+Tests (`*_test.go`) start a real Caddy through `caddytest` on ports 2999 and 9080 and need the Anubis checkout with generated assets (see build.yml for the `-modfile` replacement). `go vet ./...` is the static check.

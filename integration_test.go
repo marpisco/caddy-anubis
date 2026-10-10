@@ -1,0 +1,691 @@
+package caddyanubis
+
+import (
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/caddyserver/caddy/v2/caddytest"
+)
+
+const (
+	httpPort          = 9080
+	passChallengePath = "/.within.website/x/cmd/anubis/api/pass-challenge"
+	browserUserAgent  = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+)
+
+const (
+	adminAddr = "localhost:2999"
+	adminURL  = "http://" + adminAddr
+)
+
+// globalOptionsBody is the global options block every test Caddy runs with.
+const globalOptionsBody = `	skip_install_trust
+	persist_config off
+	admin ` + adminAddr + `
+	http_port 9080
+	https_port 9443
+	grace_period 1ns
+`
+
+var challengeRe = regexp.MustCompile(`(?s)<script id="anubis_challenge"[^>]*>(.*?)</script>`)
+
+// buildCaddyfile returns a Caddyfile with the shared global options, extra
+// global options such as a servers block, and the site blocks.
+func buildCaddyfile(globalExtra string, sites ...string) string {
+	return "{\n" + globalOptionsBody + globalExtra + "}\n" + strings.Join(sites, "\n")
+}
+
+// startCaddy runs a real Caddy with the given site blocks.
+func startCaddy(t *testing.T, sites ...string) {
+	t.Helper()
+	startCaddyWithGlobal(t, "", sites...)
+}
+
+// startCaddyWithGlobal is startCaddy with extra global options, such as a
+// servers block.
+func startCaddyWithGlobal(t *testing.T, globalExtra string, sites ...string) {
+	t.Helper()
+	caddytest.NewTester(t).InitServer(buildCaddyfile(globalExtra, sites...), "caddyfile")
+}
+
+// writePolicy writes a policy that allows paths matching openRegex without a
+// challenge and challenges everything else. It returns the file path.
+func writePolicy(t *testing.T, openRegex string) string {
+	t.Helper()
+	return writePolicyWith(t, openRegex, "")
+}
+
+// openGraphPolicy is extra policy YAML that enables Open Graph tags.
+const openGraphPolicy = `openGraph:
+  enabled: true
+  considerHost: false
+  ttl: 1h
+`
+
+// challengeEverything is a bot rule that challenges every request no earlier
+// rule matched. Test policies end with it.
+const challengeEverything = `  - name: everything-else
+    path_regex: ".*"
+    action: CHALLENGE
+    challenge:
+      algorithm: fast
+      difficulty: 1
+`
+
+// writePolicyWith is writePolicy with extra top-level policy YAML appended.
+func writePolicyWith(t *testing.T, openRegex, extra string) string {
+	t.Helper()
+	return writePolicyFile(t, fmt.Sprintf(`bots:
+  - name: open
+    path_regex: %q
+    action: ALLOW
+`+challengeEverything+`dnsbl: false
+%s`, openRegex, extra))
+}
+
+// writePolicyFile writes policy YAML to a temp file and returns its path.
+func writePolicyFile(t *testing.T, policy string) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(file, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.ToSlash(file)
+}
+
+// protectedSite is a site with init_anubis plus an anubis handler in front of
+// a site-specific response.
+func protectedSite(host, policyFile, body string) string {
+	return fmt.Sprintf(`http://%s:%d {
+	init_anubis {
+		policy_file %q
+	}
+	handle {
+		anubis
+		respond %q
+	}
+}
+`, host, httpPort, policyFile, body)
+}
+
+func siteURL(host, path string) string {
+	return fmt.Sprintf("http://%s:%d%s", host, httpPort, path)
+}
+
+type page struct {
+	status int
+	header http.Header
+	body   string
+}
+
+func (p page) isChallenge() bool {
+	return challengeRe.MatchString(p.body)
+}
+
+// browser is an HTTP client that behaves like a browser: it keeps cookies,
+// does not follow redirects on its own and reaches Caddy on loopback no
+// matter which host name is requested.
+type browser struct {
+	t      *testing.T
+	client *http.Client
+}
+
+func newBrowser(t *testing.T) *browser {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &browser{t: t, client: &http.Client{
+		Jar:     jar,
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", httpPort))
+			},
+		},
+	}}
+}
+
+// get requests rawURL, optionally sending extra cookies.
+func (b *browser) get(rawURL string, cookies ...*http.Cookie) page {
+	b.t.Helper()
+	return b.getWith(rawURL, nil, cookies...)
+}
+
+// getWith is get with extra request headers. A header given here replaces the
+// browser default of the same name, such as User-Agent.
+func (b *browser) getWith(rawURL string, headers http.Header, cookies ...*http.Cookie) page {
+	b.t.Helper()
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	req.Header.Set("User-Agent", browserUserAgent)
+	// Anubis randomly rejects clients that do not accept gzip.
+	req.Header.Set("Accept-Encoding", "gzip")
+	for name, values := range headers {
+		req.Header[name] = values
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		b.t.Fatalf("GET %s: %v", rawURL, err)
+	}
+	defer resp.Body.Close()
+
+	var reader io.Reader = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			b.t.Fatalf("GET %s: %v", rawURL, err)
+		}
+		reader = gz
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		b.t.Fatalf("GET %s: reading body: %v", rawURL, err)
+	}
+	return page{status: resp.StatusCode, header: resp.Header, body: string(body)}
+}
+
+// cookiesFor returns the cookies the browser holds for rawURL.
+func (b *browser) cookiesFor(rawURL string) []*http.Cookie {
+	b.t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	return b.client.Jar.Cookies(u)
+}
+
+// passChallenge requests rawURL, solves the challenge it answers with the way
+// the Anubis script does, and returns the page served after the redirect.
+func (b *browser) passChallenge(rawURL string) page {
+	b.t.Helper()
+	passed := b.passChallengeResponse(rawURL)
+	return b.get(passed.header.Get("Location"))
+}
+
+// passChallengeResponse solves the challenge for rawURL like passChallenge does
+// and returns the pass-challenge response itself, before the redirect.
+func (b *browser) passChallengeResponse(rawURL string) page {
+	b.t.Helper()
+	p := b.get(rawURL)
+	match := challengeRe.FindStringSubmatch(p.body)
+	if match == nil {
+		b.t.Fatalf("GET %s: want a challenge page, got status %d: %.200s", rawURL, p.status, p.body)
+	}
+
+	var data struct {
+		Rules struct {
+			Difficulty int `json:"difficulty"`
+		} `json:"rules"`
+		Challenge struct {
+			ID         string `json:"id"`
+			RandomData string `json:"randomData"`
+		} `json:"challenge"`
+	}
+	if err := json.Unmarshal([]byte(match[1]), &data); err != nil {
+		b.t.Fatalf("GET %s: bad challenge data: %v", rawURL, err)
+	}
+
+	zeros := strings.Repeat("0", data.Rules.Difficulty)
+	nonce := 0
+	hash := ""
+	for ; ; nonce++ {
+		sum := sha256.Sum256([]byte(data.Challenge.RandomData + strconv.Itoa(nonce)))
+		hash = hex.EncodeToString(sum[:])
+		if strings.HasPrefix(hash, zeros) {
+			break
+		}
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	query := url.Values{
+		"id":          {data.Challenge.ID},
+		"response":    {hash},
+		"nonce":       {strconv.Itoa(nonce)},
+		"redir":       {rawURL},
+		"elapsedTime": {"1"},
+	}
+	passed := b.get(u.Scheme + "://" + u.Host + passChallengePath + "?" + query.Encode())
+	if passed.status != http.StatusFound {
+		b.t.Fatalf("pass-challenge for %s: want 302, got %d: %.200s", rawURL, passed.status, passed.body)
+	}
+	return passed
+}
+
+func assertBody(t *testing.T, p page, want string) {
+	t.Helper()
+	if p.status != http.StatusOK || p.body != want {
+		t.Errorf("got status %d body %.100q, want 200 %q", p.status, p.body, want)
+	}
+}
+
+func assertChallenged(t *testing.T, p page) {
+	t.Helper()
+	if !p.isChallenge() {
+		t.Errorf("got status %d body %.100q, want a challenge page", p.status, p.body)
+	}
+}
+
+func TestTwoSitesUseTheirOwnPolicy(t *testing.T) {
+	orders := map[string][]string{
+		"a then b": {"a", "b"},
+		"b then a": {"b", "a"},
+	}
+	for name, order := range orders {
+		t.Run(name, func(t *testing.T) {
+			policies := map[string]string{
+				"a": writePolicy(t, `^/open-a`),
+				"b": writePolicy(t, `^/open-b`),
+			}
+			var sites []string
+			for _, id := range order {
+				sites = append(sites, protectedSite(id+".localhost", policies[id], "site-"+id))
+			}
+			startCaddy(t, sites...)
+
+			visitor := newBrowser(t)
+			assertBody(t, visitor.get(siteURL("a.localhost", "/open-a")), "site-a")
+			assertChallenged(t, visitor.get(siteURL("b.localhost", "/open-a")))
+			assertBody(t, visitor.get(siteURL("b.localhost", "/open-b")), "site-b")
+			assertChallenged(t, visitor.get(siteURL("a.localhost", "/open-b")))
+
+			for _, id := range []string{"a", "b"} {
+				assertBody(t, visitor.passChallenge(siteURL(id+".localhost", "/page")), "site-"+id)
+				assertBody(t, visitor.get(siteURL(id+".localhost", "/page")), "site-"+id)
+			}
+		})
+	}
+}
+
+func TestChallengeCookieOfOneSiteDoesNotUnlockAnother(t *testing.T) {
+	startCaddy(t,
+		protectedSite("a.localhost", writePolicy(t, `^/open-a`), "site-a"),
+		protectedSite("b.localhost", writePolicy(t, `^/open-b`), "site-b"),
+	)
+
+	visitor := newBrowser(t)
+	assertBody(t, visitor.passChallenge(siteURL("a.localhost", "/page")), "site-a")
+	cookies := visitor.cookiesFor(siteURL("a.localhost", "/page"))
+	if len(cookies) == 0 {
+		t.Fatal("no cookie after passing the challenge on site a")
+	}
+
+	assertBody(t, newBrowser(t).get(siteURL("a.localhost", "/page"), cookies...), "site-a")
+	assertChallenged(t, newBrowser(t).get(siteURL("b.localhost", "/page"), cookies...))
+}
+
+func TestPathScopedAnubisUnderInitAnubis(t *testing.T) {
+	startCaddy(t, fmt.Sprintf(`http://admin.localhost:%d {
+	init_anubis {
+		policy_file %q
+	}
+	handle /admin/* {
+		anubis
+		respond "admin-body"
+	}
+	handle {
+		respond "public-body"
+	}
+}
+`, httpPort, writePolicy(t, `^/nothing-is-open`)))
+
+	visitor := newBrowser(t)
+	assertBody(t, visitor.get(siteURL("admin.localhost", "/")), "public-body")
+
+	challenge := visitor.get(siteURL("admin.localhost", "/admin/x"))
+	assertChallenged(t, challenge)
+	asset := regexp.MustCompile(`src="(/\.within\.website/[^"]+)"`).FindStringSubmatch(challenge.body)
+	if asset == nil {
+		t.Fatal("challenge page references no /.within.website/ asset")
+	}
+	if got := visitor.get(siteURL("admin.localhost", asset[1])); got.status != http.StatusOK {
+		t.Errorf("asset %s: status %d, want 200", asset[1], got.status)
+	}
+
+	assertBody(t, visitor.passChallenge(siteURL("admin.localhost", "/admin/x")), "admin-body")
+}
+
+func TestStandaloneAnubisChallenges(t *testing.T) {
+	startCaddy(t, fmt.Sprintf(`http://solo.localhost:%d {
+	handle {
+		anubis {
+			policy_file %q
+		}
+		respond "solo-body"
+	}
+}
+`, httpPort, writePolicy(t, `^/nothing-is-open`)))
+
+	visitor := newBrowser(t)
+	assertChallenged(t, visitor.get(siteURL("solo.localhost", "/page")))
+	assertBody(t, visitor.passChallenge(siteURL("solo.localhost", "/page")), "solo-body")
+}
+
+func TestSiteWithoutAnubisIsUntouched(t *testing.T) {
+	startCaddy(t,
+		protectedSite("a.localhost", writePolicy(t, `^/open-a`), "site-a"),
+		fmt.Sprintf("http://plain.localhost:%d {\n\trespond \"plain-body\"\n}\n", httpPort),
+	)
+
+	visitor := newBrowser(t)
+	assertBody(t, visitor.get(siteURL("plain.localhost", "/page")), "plain-body")
+	assertBody(t, visitor.get(siteURL("plain.localhost", "/.within.website/x/cmd/anubis/static/js/main.mjs")), "plain-body")
+	assertBody(t, visitor.get(siteURL("plain.localhost", "/robots.txt")), "plain-body")
+}
+
+func TestInitAnubisAnswers404ForUnknownAnubisPaths(t *testing.T) {
+	startCaddy(t, protectedSite("a.localhost", writePolicy(t, `^/\.within\.website/missing`), "site-a"))
+
+	got := newBrowser(t).get(siteURL("a.localhost", "/.within.website/missing"))
+	if got.status != http.StatusNotFound {
+		t.Errorf("status %d, want 404", got.status)
+	}
+}
+
+func TestSharedOptionOnHandlerConflictsWithInitAnubis(t *testing.T) {
+	policy := writePolicy(t, `^/open-a`)
+	handlerOptions := map[string]string{
+		"policy_file":      fmt.Sprintf("policy_file %q", policy),
+		"serve_robots_txt": "serve_robots_txt",
+	}
+	for name, option := range handlerOptions {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, fmt.Sprintf(`http://conflict.localhost:%d {
+	init_anubis
+	handle {
+		anubis {
+			%s
+		}
+		respond "upstream-body"
+	}
+}
+`, httpPort, option))
+
+			got := newBrowser(t).get(siteURL("conflict.localhost", "/open-a"))
+			if got.status != http.StatusInternalServerError || strings.Contains(got.body, "upstream-body") {
+				t.Errorf("got status %d body %.100q, want 500 without the upstream body", got.status, got.body)
+			}
+		})
+	}
+}
+
+func TestRobotsTXTIsUpstreamByDefault(t *testing.T) {
+	policy := writePolicy(t, `^/robots\.txt$`)
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://robots.localhost:%d {
+	handle {
+		anubis {
+			policy_file %q
+		}
+		respond "site-robots"
+	}
+}
+`, httpPort, policy),
+		"with init_anubis": protectedSite("robots.localhost", policy, "site-robots"),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			assertBody(t, newBrowser(t).get(siteURL("robots.localhost", "/robots.txt")), "site-robots")
+		})
+	}
+}
+
+func TestServeRobotsTXTOptionServesAnubisRobots(t *testing.T) {
+	policy := writePolicy(t, `^/robots\.txt$`)
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://robots.localhost:%d {
+	handle {
+		anubis {
+			policy_file %q
+			serve_robots_txt
+		}
+		respond "site-robots"
+	}
+}
+`, httpPort, policy),
+		"with init_anubis": fmt.Sprintf(`http://robots.localhost:%d {
+	init_anubis {
+		policy_file %q
+		serve_robots_txt
+	}
+	handle {
+		anubis
+		respond "site-robots"
+	}
+}
+`, httpPort, policy),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			got := newBrowser(t).get(siteURL("robots.localhost", "/robots.txt"))
+			if got.status != http.StatusOK || !strings.Contains(got.body, "User-agent:") || got.body == "site-robots" {
+				t.Errorf("got status %d body %.100q, want 200 with Anubis robots.txt", got.status, got.body)
+			}
+		})
+	}
+}
+
+func TestDownstreamErrorRunsHandleErrors(t *testing.T) {
+	policy := writePolicy(t, `^/open`)
+
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://e.localhost:%d {
+		handle {
+			anubis {
+				policy_file %q
+			}
+			error "boom" 502
+		}
+		handle_errors {
+			respond "handled {err.status_code}" 502
+		}
+	}
+	`, httpPort, policy),
+		"with init_anubis": fmt.Sprintf(`http://e.localhost:%d {
+		init_anubis {
+			policy_file %q
+		}
+		handle {
+			anubis
+			error "boom" 502
+		}
+		handle_errors {
+			respond "handled {err.status_code}" 502
+		}
+	}
+	`, httpPort, policy),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			got := newBrowser(t).get(siteURL("e.localhost", "/open"))
+			if got.status != http.StatusBadGateway || got.body != "handled 502" {
+				t.Errorf("got status %d body %.100q, want 502 %q", got.status, got.body, "handled 502")
+			}
+		})
+	}
+}
+
+func TestCookieDomainOption(t *testing.T) {
+	policy := writePolicy(t, `^/open-a`)
+	startCaddy(t,
+		fmt.Sprintf(`http://app.example.localhost:%d {
+	init_anubis {
+		policy_file %q
+		cookie_domain example.localhost
+	}
+	handle {
+		anubis
+		respond "site-app"
+	}
+}
+`, httpPort, policy),
+		protectedSite("plain.example.localhost", policy, "site-plain"),
+	)
+
+	visitor := newBrowser(t)
+	passed := visitor.passChallengeResponse(siteURL("app.example.localhost", "/page"))
+	cookies := strings.Join(passed.header.Values("Set-Cookie"), "\n")
+	if !strings.Contains(cookies, "Domain=example.localhost") {
+		t.Errorf("Set-Cookie = %q, want Domain=example.localhost", cookies)
+	}
+	assertBody(t, visitor.get(siteURL("app.example.localhost", "/page")), "site-app")
+
+	passed = visitor.passChallengeResponse(siteURL("plain.example.localhost", "/page"))
+	cookies = strings.Join(passed.header.Values("Set-Cookie"), "\n")
+	if cookies == "" || strings.Contains(cookies, "Domain=") {
+		t.Errorf("Set-Cookie = %q, want a cookie without a Domain attribute", cookies)
+	}
+}
+
+// ogUpstream is a backend whose pages carry an og:title tag. It records the
+// requests it gets, so a test can see what Anubis fetched from it.
+type ogUpstream struct {
+	*httptest.Server
+	mu   sync.Mutex
+	seen []string
+}
+
+func newOGUpstream(t *testing.T) *ogUpstream {
+	t.Helper()
+	u := &ogUpstream{}
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.mu.Lock()
+		u.seen = append(u.seen, r.Host+r.URL.RequestURI())
+		u.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><html><head><title>Real Page</title><meta property="og:title" content="Real Page Title"></head><body>real page</body></html>`)
+	}))
+	t.Cleanup(u.Close)
+	return u
+}
+
+// requests returns the Host and request URI of every request the upstream got.
+func (u *ogUpstream) requests() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.seen...)
+}
+
+func TestOpenGraphTagsAreFetchedFromOpengraphTarget(t *testing.T) {
+	upstream := newOGUpstream(t)
+	policy := writePolicyWith(t, `^/nothing-is-open`, openGraphPolicy)
+	startCaddy(t, fmt.Sprintf(`http://og.localhost:%d {
+	init_anubis {
+		policy_file %q
+		opengraph_target %s
+	}
+	handle {
+		anubis
+		reverse_proxy %s
+	}
+}
+`, httpPort, policy, upstream.URL, upstream.Listener.Addr().String()))
+
+	challenge := newBrowser(t).get(siteURL("og.localhost", "/"))
+	assertChallenged(t, challenge)
+	if !strings.Contains(challenge.body, `property="og:title" content="Real Page Title"`) {
+		t.Errorf("challenge page has no og:title tag with Real Page Title")
+	}
+	t.Logf("upstream requests: %v", upstream.requests())
+}
+
+func TestOpenGraphTagsNeedTheOpenGraphPolicy(t *testing.T) {
+	upstream := newOGUpstream(t)
+	policy := writePolicy(t, `^/nothing-is-open`)
+	startCaddy(t, fmt.Sprintf(`http://nog.localhost:%d {
+	init_anubis {
+		policy_file %q
+		opengraph_target %s
+	}
+	handle {
+		anubis
+		reverse_proxy %s
+	}
+}
+`, httpPort, policy, upstream.URL, upstream.Listener.Addr().String()))
+
+	challenge := newBrowser(t).get(siteURL("nog.localhost", "/"))
+	assertChallenged(t, challenge)
+	if strings.Contains(challenge.body, "Real Page Title") {
+		t.Errorf("challenge page carries Real Page Title without an openGraph policy")
+	}
+	if got := upstream.requests(); len(got) != 0 {
+		t.Errorf("upstream got requests %v, want none", got)
+	}
+}
+
+func TestTargetRedirectsWhenAllowed(t *testing.T) {
+	const target = "https://example.com/"
+	policy := writePolicy(t, `^/open-a`)
+
+	layouts := map[string]string{
+		"standalone": fmt.Sprintf(`http://t.localhost:%d {
+	handle {
+		anubis {
+			target %s
+			policy_file %q
+		}
+	}
+}
+`, httpPort, target, policy),
+		"with init_anubis": fmt.Sprintf(`http://t.localhost:%d {
+	init_anubis {
+		policy_file %q
+	}
+	handle {
+		anubis {
+			target %s
+		}
+	}
+}
+`, httpPort, policy, target),
+	}
+	for name, caddyfile := range layouts {
+		t.Run(name, func(t *testing.T) {
+			startCaddy(t, caddyfile)
+
+			got := newBrowser(t).get(siteURL("t.localhost", "/open-a"))
+			if got.status != http.StatusTemporaryRedirect || got.header.Get("Location") != target {
+				t.Errorf("got status %d Location %q, want 307 to %s", got.status, got.header.Get("Location"), target)
+			}
+		})
+	}
+}

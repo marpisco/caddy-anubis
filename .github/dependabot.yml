@@ -6,3 +6,4 @@ updates:
       interval: daily
     allow:
       - dependency-name: github.com/TecharoHQ/anubis
+      - dependency-name: github.com/caddyserver/caddy/v2

@@ -3,7 +3,7 @@
 }
 
 :8080 {
-	# Provisions the global Anubis server and serves static assets at /.within.website/
+	# The Anubis server of this site; serves its assets and challenge API at /.within.website/
 	init_anubis
 
 	handle {

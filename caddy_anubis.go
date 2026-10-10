@@ -3,14 +3,13 @@ package caddyanubis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
-	"sync/atomic"
 
 	"github.com/TecharoHQ/anubis"
 	libanubis "github.com/TecharoHQ/anubis/lib"
-	"github.com/TecharoHQ/anubis/lib/policy"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -19,32 +18,138 @@ import (
 	"go.uber.org/zap"
 )
 
-// anubisServer holds the most recently provisioned Anubis server.
-// The static middleware reads this to serve /.within.website/ assets.
-var anubisServer atomic.Pointer[libanubis.Server]
+const (
+	// anubisPathPrefix is where Anubis serves its assets and challenge API.
+	anubisPathPrefix = "/.within.website/"
 
-// nextHandlerCtxKey is used to pass the Caddy next handler through the
-// request context, avoiding shared mutable state on the middleware struct.
-type nextHandlerCtxKey struct{}
+	// siteServerVarKey is the request variable init_anubis uses to publish
+	// the site's Anubis server to the anubis handlers further down the chain.
+	siteServerVarKey = "anubis.site_server"
+)
+
+// downstreamCtxKey is used to pass the handler that runs after Anubis allows a
+// request through the request context. It lets one Anubis server serve
+// several handlers.
+type downstreamCtxKey struct{}
+
+// downstream is what Anubis calls once it allows a request.
+type downstream struct {
+	next caddyhttp.Handler
+	err  error
+}
 
 func init() {
 	caddy.RegisterModule(AnubisMiddleware{})
-	caddy.RegisterModule(anubisStaticMiddleware{})
 	caddy.RegisterModule(initAnubisMiddleware{})
-	httpcaddyfile.RegisterHandlerDirective("anubisStatic", parseAnubisStatic)
 	httpcaddyfile.RegisterHandlerDirective("anubis", parseAnubis)
 	httpcaddyfile.RegisterDirectiveOrder("anubis", httpcaddyfile.After, "invoke")
 	httpcaddyfile.RegisterDirective("init_anubis", parseInitAnubis)
 	httpcaddyfile.RegisterDirectiveOrder("init_anubis", httpcaddyfile.Before, "invoke")
 }
 
+// anubisOptions are the options shared by anubis and init_anubis.
+type anubisOptions struct {
+	PolicyFile      string `json:"policy_file,omitempty"`
+	ServeRobotsTXT  bool   `json:"serve_robots_txt,omitempty"`
+	CookieDomain    string `json:"cookie_domain,omitempty"`
+	OpenGraphTarget string `json:"opengraph_target,omitempty"`
+}
+
+// unmarshalOption parses the Caddyfile option the dispenser is on.
+func (o *anubisOptions) unmarshalOption(d *caddyfile.Dispenser) error {
+	switch d.Val() {
+	case "policy_file":
+		val, err := singleArg(d)
+		if err != nil {
+			return err
+		}
+		o.PolicyFile = val
+	case "serve_robots_txt":
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+		o.ServeRobotsTXT = true
+	case "cookie_domain":
+		val, err := singleArg(d)
+		if err != nil {
+			return err
+		}
+		o.CookieDomain = val
+	case "opengraph_target":
+		val, err := singleArg(d)
+		if err != nil {
+			return err
+		}
+		o.OpenGraphTarget = val
+	default:
+		return d.Errf("unrecognized option: %s", d.Val())
+	}
+	return nil
+}
+
+// singleArg reads the one argument of the option the dispenser is on.
+func singleArg(d *caddyfile.Dispenser) (string, error) {
+	if !d.NextArg() {
+		return "", d.ArgErr()
+	}
+	val := d.Val()
+	if d.NextArg() {
+		return "", d.ArgErr()
+	}
+	return val, nil
+}
+
+// newServer loads the policy and builds an Anubis server with its own signing
+// key and challenge store.
+func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) {
+	pol, err := libanubis.LoadPoliciesOrDefault(ctx, o.PolicyFile, anubis.DefaultDifficulty, "info", false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Without overrides Anubis fetches the real pages to read their tags, and
+	// it needs an address to fetch them from.
+	if pol.OpenGraph.Enabled && len(pol.OpenGraph.Override) == 0 && o.OpenGraphTarget == "" {
+		return nil, errors.New("anubis: the policy enables openGraph, set opengraph_target to the address the pages can be fetched from")
+	}
+
+	return libanubis.New(libanubis.Options{
+		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			down, ok := r.Context().Value(downstreamCtxKey{}).(*downstream)
+			if !ok || down.next == nil {
+				http.NotFound(w, r)
+				return
+			}
+			down.err = down.next.ServeHTTP(w, r)
+		}),
+		Policy:           pol,
+		OpenGraph:        pol.OpenGraph,
+		Target:           o.OpenGraphTarget,
+		CookieDomain:     o.CookieDomain,
+		ServeRobotsTXT:   o.ServeRobotsTXT,
+		CookieExpiration: anubis.CookieDefaultExpirationTime,
+	})
+}
+
+// serveAnubis lets srv handle r. The next handler is what runs when Anubis
+// allows the request. It returns the error of that handler, if any.
+func serveAnubis(srv *libanubis.Server, w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	setAnubisClientIP(r)
+	down := &downstream{next: next}
+	ctx := context.WithValue(r.Context(), downstreamCtxKey{}, down)
+	srv.ServeHTTP(w, r.WithContext(ctx))
+	return down.err
+}
+
 // AnubisMiddleware is a Caddy middleware that integrates Anubis proof-of-work
 // challenges to protect upstream resources from scraper bots and AI crawlers.
+// When the site has init_anubis it uses the site's Anubis server and policy;
+// otherwise it uses a server of its own.
 type AnubisMiddleware struct {
-	Target     *string `json:"target,omitempty"`
-	PolicyFile string  `json:"policy_file,omitempty"`
+	anubisOptions
 
-	anubisPolicy *policy.ParsedConfig
+	Target *string `json:"target,omitempty"`
+
 	anubisServer *libanubis.Server
 	logger       *zap.Logger
 }
@@ -59,36 +164,13 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
 
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", false)
+	// Built even if init_anubis ends up serving requests, so that a broken
+	// policy file fails the config load.
+	srv, err := m.newServer(ctx)
 	if err != nil {
 		return err
 	}
-	m.anubisPolicy = pol
-
-	m.anubisServer, err = libanubis.New(libanubis.Options{
-		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if m.Target != nil {
-				http.Redirect(w, r, *m.Target, http.StatusTemporaryRedirect)
-				return
-			}
-			next, ok := r.Context().Value(nextHandlerCtxKey{}).(caddyhttp.Handler)
-			if ok && next != nil {
-				if err := next.ServeHTTP(w, r); err != nil {
-					m.logger.Error("downstream handler error", zap.Error(err))
-				}
-			}
-		}),
-		Policy:           m.anubisPolicy,
-		ServeRobotsTXT:   true,
-		CookieExpiration: anubis.CookieDefaultExpirationTime,
-	})
-	if err != nil {
-		return err
-	}
-
-	// If init_anubis has not provisioned a global server yet, store ours
-	// so that static asset routes can delegate to it.
-	anubisServer.CompareAndSwap(nil, m.anubisServer)
+	m.anubisServer = srv
 	m.logger.Info("anubis middleware provisioned")
 	return nil
 }
@@ -96,9 +178,24 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 func (m *AnubisMiddleware) Validate() error { return nil }
 
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	setAnubisClientIP(r)
-	ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
-	m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
+	srv := m.anubisServer
+	if siteServer, ok := caddyhttp.GetVar(r.Context(), siteServerVarKey).(*libanubis.Server); ok {
+		if m.anubisOptions != (anubisOptions{}) {
+			return caddyhttp.Error(http.StatusInternalServerError,
+				errors.New("anubis: the site has init_anubis, so only target may be set on the anubis handler; set the other options on init_anubis instead"))
+		}
+		srv = siteServer
+	}
+
+	if m.Target != nil {
+		next = caddyhttp.HandlerFunc(m.redirectToTarget)
+	}
+	return serveAnubis(srv, w, r, next)
+}
+
+// redirectToTarget sends the visitor to the configured target.
+func (m *AnubisMiddleware) redirectToTarget(w http.ResponseWriter, r *http.Request) error {
+	http.Redirect(w, r, *m.Target, http.StatusTemporaryRedirect)
 	return nil
 }
 
@@ -125,16 +222,15 @@ func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "target":
-			if d.NextArg() {
-				val := d.Val()
-				m.Target = &val
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
-		case "policy_file":
-			if d.NextArg() {
-				m.PolicyFile = d.Val()
-			}
+			val := d.Val()
+			m.Target = &val
 		default:
-			return d.Errf("unrecognized option: %s", d.Val())
+			if err := m.unmarshalOption(d); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -143,54 +239,19 @@ func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 func parseAnubis(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m AnubisMiddleware
-	m.UnmarshalCaddyfile(h.Dispenser)
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
-// anubisStaticMiddleware serves Anubis static assets (/.within.website/) by
-// delegating to the Anubis server provisioned by the anubis directive.
-// Used for backward compatibility when init_anubis is not present.
-type anubisStaticMiddleware struct{}
-
-func (anubisStaticMiddleware) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "http.handlers.anubis_static",
-		New: func() caddy.Module { return new(anubisStaticMiddleware) },
-	}
-}
-
-func (anubisStaticMiddleware) Provision(caddy.Context) error { return nil }
-func (anubisStaticMiddleware) Validate() error               { return nil }
-
-func (anubisStaticMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	srv := anubisServer.Load()
-	if srv == nil || !strings.HasPrefix(r.URL.Path, "/.within.website/") {
-		return next.ServeHTTP(w, r)
-	}
-	setAnubisClientIP(r)
-	r.RequestURI = r.URL.RequestURI()
-	srv.ServeHTTP(w, r)
-	return nil
-}
-
-func (anubisStaticMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	d.Next() // consume directive name
-	return nil
-}
-
-func parseAnubisStatic(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var m anubisStaticMiddleware
-	m.UnmarshalCaddyfile(h.Dispenser)
-	return m, nil
-}
-
-// initAnubisMiddleware provisions the global Anubis server and serves static
-// assets at /.within.website/. This directive should be placed at the server
-// level (not inside a handle block) to ensure static assets are accessible
-// regardless of which paths the anubis directive protects.
+// initAnubisMiddleware is the Anubis server of a site. It serves the assets and
+// the challenge API under /.within.website/ and publishes its server to the
+// anubis handlers of the same site, so they all share one policy, key and
+// challenge store. Place it once per site block, outside any handle block.
 type initAnubisMiddleware struct {
-	PolicyFile   string `json:"policy_file,omitempty"`
-	anubisPolicy *policy.ParsedConfig
+	anubisOptions
+
 	anubisServer *libanubis.Server
 	logger       *zap.Logger
 }
@@ -205,25 +266,11 @@ func (initAnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("init_anubis")
 
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", false)
+	srv, err := m.newServer(ctx)
 	if err != nil {
 		return err
 	}
-	m.anubisPolicy = pol
-
-	m.anubisServer, err = libanubis.New(libanubis.Options{
-		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.NotFound(w, r)
-		}),
-		Policy:           pol,
-		ServeRobotsTXT:   true,
-		CookieExpiration: anubis.CookieDefaultExpirationTime,
-	})
-	if err != nil {
-		return err
-	}
-
-	anubisServer.Store(m.anubisServer)
+	m.anubisServer = srv
 	m.logger.Info("init_anubis provisioned")
 	return nil
 }
@@ -231,12 +278,12 @@ func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 func (initAnubisMiddleware) Validate() error { return nil }
 
 func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if strings.HasPrefix(r.URL.Path, "/.within.website/") {
-		setAnubisClientIP(r)
+	if strings.HasPrefix(r.URL.Path, anubisPathPrefix) {
 		r.RequestURI = r.URL.RequestURI()
-		m.anubisServer.ServeHTTP(w, r)
-		return nil
+		return serveAnubis(m.anubisServer, w, r, nil)
 	}
+
+	caddyhttp.SetVar(r.Context(), siteServerVarKey, m.anubisServer)
 	return next.ServeHTTP(w, r)
 }
 
@@ -244,13 +291,8 @@ func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error 
 	d.Next() // consume directive name
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
-		switch d.Val() {
-		case "policy_file":
-			if d.NextArg() {
-				m.PolicyFile = d.Val()
-			}
-		default:
-			return d.Errf("unrecognized option: %s", d.Val())
+		if err := m.unmarshalOption(d); err != nil {
+			return err
 		}
 	}
 
@@ -258,39 +300,22 @@ func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error 
 }
 
 func parseInitAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
-	if !h.Next() {
-		return nil, h.ArgErr()
-	}
-
-	d := h.Dispenser
 	var m initAnubisMiddleware
-
-	for d.NextBlock(0) {
-		switch d.Val() {
-		case "policy_file":
-			if !d.NextArg() {
-				return nil, d.ArgErr()
-			}
-			m.PolicyFile = d.Val()
-		default:
-			return nil, d.Errf("unrecognized option: %s", d.Val())
-		}
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
 	}
 
 	mod, _ := caddy.GetModule("http.handlers.init_anubis")
 	var warnings []caddyconfig.Warning
 	jsonObj := caddyconfig.JSONModuleObject(m, "handler", mod.ID.Name(), &warnings)
 
-	matcherSet := caddy.ModuleMap{
-		"path": caddyconfig.JSON(caddyhttp.MatchPath{"/.within.website/*"}, nil),
-	}
-
+	// No matcher: the handler must see every request of the site to publish
+	// its server to the anubis handlers.
 	return []httpcaddyfile.ConfigValue{
 		{
 			Class: "route",
 			Value: caddyhttp.Route{
-				MatcherSetsRaw: []caddy.ModuleMap{matcherSet},
-				HandlersRaw:    []json.RawMessage{jsonObj},
+				HandlersRaw: []json.RawMessage{jsonObj},
 			},
 		},
 	}, nil
