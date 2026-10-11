@@ -78,28 +78,23 @@ xcaddy build \
 
 The local Caddyfile serves on `:8080` with `init_anubis` + `anubis` in a `handle` block, falling back to `web/` file server.
 
-## Git Commits
+## Commit style
 
-### Identity
-
-The author is always the maintainer, Marco Pisco. Never modify the configured local/global/repository git config; set the author via runtime flags only, and credit Claude as co-author with a trailer naming the model that actually made the change (e.g. `Claude Opus 5.5`). Never use another model's name.
-
-```bash
-git -c user.name="Marco Pisco" -c user.email=marco@marcopisco.com commit -F "${MESSAGE_FILE}"
-```
-
-The message ends with:
+Use Conventional Commits with this title format:
 
 ```text
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+type(scope): short message
 ```
 
-### Style
+Examples:
 
-Conventional Commits, in English: `type(scope): short message` (e.g. `fix(anubis): handle missing policy file`). After the title, a body that explains what changed, why, important behavior, and what was tested (and what could not be).
+```text
+feat(reservations): add room filter
+fix(login): handle expired session
+refactor(admin): simplify approval flow
+```
 
-- Small, scoped changes; no unrelated refactors or unrequested features.
-- Plans go under `docs/`. Spec, plan, and code are three separate commits (e.g. `docs(feature): add plan for feature`).
+Use a longer body after the title. Explain what changed, why it changed, and important behavior or testing.
 
 ## CI/CD
 
