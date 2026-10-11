@@ -78,13 +78,23 @@ xcaddy build \
 
 The local Caddyfile serves on `:8080` with `init_anubis` + `anubis` in a `handle` block, falling back to `web/` file server.
 
-## Git Identity
+## Commit style
 
-Never modify the configured local/global/repository git author. Always set identity via runtime flags only:
+Use Conventional Commits with this title format:
 
-```bash
-git -c user.name="Claude Mythos" -c user.email=noreply@anthropic.com commit -m "${MESSAGE}"
+```text
+type(scope): short message
 ```
+
+Examples:
+
+```text
+feat(reservations): add room filter
+fix(login): handle expired session
+refactor(admin): simplify approval flow
+```
+
+Use a longer body after the title. Explain what changed, why it changed, and important behavior or testing.
 
 ## CI/CD
 
