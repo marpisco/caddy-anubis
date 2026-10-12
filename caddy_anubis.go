@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/TecharoHQ/anubis"
 	libanubis "github.com/TecharoHQ/anubis/lib"
 	"github.com/TecharoHQ/anubis/lib/config"
+	"github.com/TecharoHQ/anubis/lib/policy"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -52,6 +54,77 @@ const (
 // request through the request context. It lets one Anubis server serve
 // several handlers.
 type downstreamCtxKey struct{}
+
+// decisionCtxKey is the request context key of the decision holder.
+type decisionCtxKey struct{}
+
+// requestDecision is where the logger records the check result of a request.
+type requestDecision struct {
+	mu     sync.Mutex
+	rule   string
+	action string
+}
+
+func (d *requestDecision) set(cr policy.CheckResult) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.rule, d.action = cr.Name, string(cr.Rule)
+}
+
+func (d *requestDecision) get() (rule, action string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.rule, d.action
+}
+
+// decisionHandler wraps the log handler of an Anubis server to read the check
+// result Anubis attaches to its request logger as "check_result". Anubis 1.28
+// sets the X-Anubis headers only for allowed and passed requests, so this is
+// the only place the rule of a challenge or a deny shows. Records are
+// forwarded only if the inner handler wants them.
+type decisionHandler struct {
+	inner slog.Handler
+	check *policy.CheckResult
+}
+
+func (h decisionHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if _, ok := ctx.Value(decisionCtxKey{}).(*requestDecision); ok {
+		return true
+	}
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h decisionHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if d, ok := ctx.Value(decisionCtxKey{}).(*requestDecision); ok && h.check != nil {
+		d.set(*h.check)
+	}
+	if !h.inner.Enabled(ctx, rec.Level) {
+		return nil
+	}
+	return h.inner.Handle(ctx, rec)
+}
+
+func (h decisionHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	for _, a := range attrs {
+		if cr, ok := a.Value.Any().(policy.CheckResult); a.Key == "check_result" && ok {
+			h.check = &cr
+		}
+	}
+	h.inner = h.inner.WithAttrs(attrs)
+	return h
+}
+
+func (h decisionHandler) WithGroup(name string) slog.Handler {
+	h.inner = h.inner.WithGroup(name)
+	return h
+}
+
+// newAnubisLogger returns the logger Anubis would use by default, with the
+// decision handler around it.
+func newAnubisLogger() *slog.Logger {
+	inner := slog.Default().Handler().WithAttrs([]slog.Attr{slog.String("subsystem", "anubis")})
+	return slog.New(decisionHandler{inner: inner})
+}
 
 // downstream is what Anubis calls once it allows a request.
 type downstream struct {
@@ -163,6 +236,7 @@ func (o *anubisOptions) newServer(ctx caddy.Context) (*libanubis.Server, error) 
 		}),
 		ED25519PrivateKey: signingKey,
 		Policy:            pol,
+		Logger:            newAnubisLogger(),
 		OpenGraph:         pol.OpenGraph,
 		Target:            o.OpenGraphTarget,
 		CookieDomain:      o.CookieDomain,
@@ -198,20 +272,28 @@ func serveAnubis(srv *libanubis.Server, w http.ResponseWriter, r *http.Request, 
 	r.Header.Del(anubisStatusHeader)
 
 	down := &downstream{next: next}
+	dec := &requestDecision{}
 	ctx := context.WithValue(r.Context(), downstreamCtxKey{}, down)
+	ctx = context.WithValue(ctx, decisionCtxKey{}, dec)
 	srv.ServeHTTP(w, r.WithContext(ctx))
-	recordAnubisDecision(r, down.called)
+	recordAnubisDecision(r, down.called, dec)
 	return down.err
 }
 
 // recordAnubisDecision sets the request variables for the decision Anubis made
 // on r. It sets nothing when Anubis made no decision, as on its own paths.
-func recordAnubisDecision(r *http.Request, called bool) {
-	action := r.Header.Get(anubisActionHeader)
+// The headers come first; without them the decision logger has the result.
+func recordAnubisDecision(r *http.Request, called bool, dec *requestDecision) {
+	rule, action := r.Header.Get(anubisRuleHeader), r.Header.Get(anubisActionHeader)
+	// Anubis' own endpoints log a check result too, but they are no decision
+	// about the visitor's request.
+	if action == "" && !strings.HasPrefix(r.URL.Path, anubisPathPrefix) {
+		rule, action = dec.get()
+	}
 	if action == "" {
 		return
 	}
-	caddyhttp.SetVar(r.Context(), anubisRuleVarKey, r.Header.Get(anubisRuleHeader))
+	caddyhttp.SetVar(r.Context(), anubisRuleVarKey, rule)
 	caddyhttp.SetVar(r.Context(), anubisResultVarKey, anubisResult(action, called))
 }
 

@@ -48,6 +48,7 @@ Anubis only takes a plain `http.Handler` as its next handler, so the Caddy next 
 
 - Go 1.26.3 or newer
 - Node.js 24 or newer with npm
+- Rust (rustup) with the `wasm32-unknown-unknown` target, needed by `npm run assets` since Anubis 1.28 (`npm ci` also runs `cargo fetch`)
 - gzip, zstd, brotli, and xcaddy
 
 ### Build Caddy with Plugin
