@@ -8,7 +8,7 @@ Source: [marpisco/caddy-anubis](https://github.com/marpisco/caddy-anubis)
 
 The Anubis Go module does not include its generated browser assets. Build Caddy from a checkout with a matching Anubis checkout whose assets have been generated.
 
-This requires Go 1.26.3 or newer, Node.js 24 or newer, npm, gzip, zstd, brotli, and xcaddy.
+This requires Go 1.26.3 or newer, Node.js 24 or newer, npm, a Rust toolchain with the `wasm32-unknown-unknown` target (Anubis 1.28 builds its WebAssembly proof-of-work modules with it), gzip, zstd, brotli, and xcaddy.
 
 ```bash
 git clone https://github.com/marpisco/caddy-anubis.git
@@ -171,7 +171,7 @@ example.com {
 
 `anubis_rule` is the name of the rule that decided. Both are `null` for requests Anubis did not check: the paths under `/.within.website/`, and requests that never reach an `anubis` handler. A solved challenge shows as a request to `/.within.website/x/cmd/anubis/api/pass-challenge` answered with 302.
 
-Anubis also adds the headers `X-Anubis-Rule`, `X-Anubis-Action` and `X-Anubis-Status` to the requests it lets through to the upstream. The module removes any copies sent by the client.
+Anubis also adds the headers `X-Anubis-Rule`, `X-Anubis-Action` and `X-Anubis-Status` to the requests it lets through to the upstream. The module removes any copies sent by the client. Since Anubis 1.28 these headers exist only for allowed and passed requests, so the module takes the rule of a challenge or a deny from the log records Anubis writes while it checks the request. This does not change what Anubis prints.
 
 Anubis' own Prometheus counters are not exposed by Caddy's metrics endpoint. Anubis writes one log line per challenge issued and per denied request, through its own logger, to Caddy's standard error.
 
