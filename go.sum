@@ -46,8 +46,8 @@ github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERo
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/OneOfOne/xxhash v1.2.2 h1:KMrpdQIwFcEqXDklaen+P1axHaj9BSKzvpUUfnHldSE=
 github.com/OneOfOne/xxhash v1.2.2/go.mod h1:HSdplMjZKSmBqAxg5vPj2TmRDmfkzw+cTzAElWljhcU=
-github.com/TecharoHQ/anubis v1.28.1 h1:FGhoB80cmr4gZN0rqg9pUAW5fUaMk0zCnNB/fVKrqMk=
-github.com/TecharoHQ/anubis v1.28.1/go.mod h1:WtgvyE50Ix48rpq4LyOJcTE3HVGsUS6MFRcA46Aomes=
+github.com/TecharoHQ/anubis v1.28.2 h1:3HRRUhEGGgJdAM7OxOAtxjGLA2SvC1SidX3amaRGqBc=
+github.com/TecharoHQ/anubis v1.28.2/go.mod h1:wiQMKcgS4qq/HS3bFBW5M0f/igHG+0yVLG68NGxkwP4=
 github.com/a-h/templ v0.3.1070 h1:3iCOXHXqFXa99OQzgkUOLJbNzv/QjFGLwKZkBAg+ADA=
 github.com/a-h/templ v0.3.1070/go.mod h1:iIqB3g2RHBe/WlnPwa+Bvhh1TKXHWLRnBD9NWHOLm78=
 github.com/alecthomas/assert/v2 v2.11.0 h1:2Q9r3ki8+JYXvGsDyBXwH3LcJ+WK5D0gc5E8vS6K3D0=
